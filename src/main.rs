@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const PREFIX_ROOT: &str = "/amu-revo";
+const SHARED_PREFIX: &str = "/amu-revo/shared";
 
 #[derive(Parser)]
 #[command(name = "ssmm", version, about = "SSM Parameter Store helper for amu-revo team")]
@@ -71,12 +72,18 @@ enum Command {
     },
     /// List all app namespaces under /amu-revo/ with parameter counts
     Dirs,
-    /// Sync SSM -> .env (regenerate .env from /amu-revo/<app>/*)
+    /// Sync SSM -> .env (app + /amu-revo/shared/* + tagged overlays)
     Sync {
         #[arg(long)]
         app: Option<String>,
         #[arg(long, short, default_value = "./.env")]
         out: PathBuf,
+        /// Skip /amu-revo/shared/* overlay (default: included)
+        #[arg(long)]
+        no_shared: bool,
+        /// Also include parameters matching tag (repeatable)
+        #[arg(long = "include-tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+        include_tags: Vec<String>,
     },
     /// Migrate parameters from an old prefix to a new prefix
     Migrate {
@@ -96,6 +103,42 @@ enum Command {
         /// Reveal actual values in --values output (default: SHA-256 prefix only)
         #[arg(long)]
         show_values: bool,
+    },
+    /// Manage tags on existing parameters
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    /// Add tags to a parameter
+    Add {
+        /// Parameter key (relative to app) or absolute path (starts with /)
+        key: String,
+        /// Tags to add
+        #[arg(value_name = "KEY=VALUE", required = true)]
+        tags: Vec<String>,
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Remove tags from a parameter
+    Remove {
+        /// Parameter key (relative to app) or absolute path (starts with /)
+        key: String,
+        /// Tag keys to remove (space-separated)
+        #[arg(value_name = "TAG_KEY", required = true)]
+        tag_keys: Vec<String>,
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// List tags on a parameter
+    List {
+        /// Parameter key (relative to app) or absolute path (starts with /)
+        key: String,
+        #[arg(long)]
+        app: Option<String>,
     },
 }
 
@@ -117,13 +160,16 @@ async fn main() -> Result<()> {
         }
         Command::Show { key, app } => cmd_show(&client, key, app).await,
         Command::Dirs => cmd_dirs(&client).await,
-        Command::Sync { app, out } => cmd_sync(&client, app, out).await,
+        Command::Sync { app, out, no_shared, include_tags } => {
+            cmd_sync(&client, app, out, no_shared, include_tags).await
+        }
         Command::Migrate { old_prefix, new_prefix, delete_old } => {
             cmd_migrate(&client, old_prefix, new_prefix, delete_old).await
         }
         Command::Check { duplicates, values, show_values } => {
             cmd_check(&client, duplicates, values, show_values).await
         }
+        Command::Tag { action } => cmd_tag(&client, action).await,
     }
 }
 
@@ -217,6 +263,18 @@ fn hash8(value: &str) -> String {
     format!("{:x}", h.finalize())[..8].to_string()
 }
 
+/// parameter key 名 (absolute or relative) を SSM name に解決
+fn resolve_param_name(key: &str, app: Option<String>) -> Result<String> {
+    if key.starts_with('/') {
+        return Ok(key.to_string());
+    }
+    let a = match app {
+        Some(a) => a,
+        None => detect_app_from_cwd()?,
+    };
+    Ok(format!("{}/{}", app_prefix(&a), env_key_to_ssm_tail(key)))
+}
+
 async fn get_parameters_by_path(client: &Client, prefix: &str) -> Result<Vec<Parameter>> {
     let mut all = Vec::new();
     let mut next: Option<String> = None;
@@ -241,7 +299,6 @@ async fn get_parameters_by_path(client: &Client, prefix: &str) -> Result<Vec<Par
     Ok(all)
 }
 
-/// タグで絞り込んだ parameter の名前集合を返す（DescribeParameters は値を返さない）
 async fn names_filtered_by_tags(
     client: &Client,
     tag_filters: &[(String, String)],
@@ -277,7 +334,6 @@ async fn names_filtered_by_tags(
     Ok(names)
 }
 
-/// 名前集合から値付き Parameter を取る (GetParameters は 10件/呼)
 async fn get_parameters_by_names(client: &Client, names: &[String]) -> Result<Vec<Parameter>> {
     let mut out = Vec::new();
     for chunk in names.chunks(10) {
@@ -324,8 +380,6 @@ async fn cmd_list(
 
     let tag_filters = parse_tags(&raw_tags)?;
 
-    // tag フィルタがあれば DescribeParameters → prefix 絞り込み → GetParameters
-    // なければ普通に GetParametersByPath
     let params: Vec<Parameter> = if tag_filters.is_empty() {
         get_parameters_by_path(client, &prefix).await?
     } else {
@@ -423,7 +477,6 @@ async fn cmd_put(
 
     let extra_tags = parse_tags(&raw_tags)?;
 
-    // tag の衝突チェック: app を user 指定で上書きできないようにする
     if extra_tags.iter().any(|(k, _)| k == "app") {
         bail!("`app` tag is reserved; do not pass --tag app=...");
     }
@@ -446,7 +499,6 @@ async fn cmd_put(
             .await
             .with_context(|| format!("put-parameter {}", name))?;
 
-        // tag: app + 任意タグ
         let mut tag_objs: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
         tag_objs.push(
             Tag::builder()
@@ -559,15 +611,7 @@ async fn cmd_delete(
 }
 
 async fn cmd_show(client: &Client, key: String, app: Option<String>) -> Result<()> {
-    let name = if key.starts_with('/') {
-        key.clone()
-    } else {
-        let a = match app {
-            Some(a) => a,
-            None => detect_app_from_cwd()?,
-        };
-        format!("{}/{}", app_prefix(&a), env_key_to_ssm_tail(&key))
-    };
+    let name = resolve_param_name(&key, app)?;
     let res = client
         .get_parameter()
         .name(&name)
@@ -609,33 +653,138 @@ async fn cmd_dirs(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_sync(client: &Client, app: Option<String>, out: PathBuf) -> Result<()> {
+async fn cmd_sync(
+    client: &Client,
+    app: Option<String>,
+    out: PathBuf,
+    no_shared: bool,
+    raw_include_tags: Vec<String>,
+) -> Result<()> {
     let app = match app {
         Some(a) => a,
         None => detect_app_from_cwd()?,
     };
     let prefix = app_prefix(&app);
-    let params = get_parameters_by_path(client, &prefix).await?;
-    if params.is_empty() {
-        bail!("no parameters under {}", prefix);
+
+    // app 本体は常に取り込み (shared と同じ app 名 = "shared" の時は衝突注意)
+    let app_params = get_parameters_by_path(client, &prefix).await?;
+    if app == "shared" {
+        // /amu-revo/shared は app namespace としては不自然、素通し許可だが overlay は抑制
     }
 
-    let mut entries: Vec<(String, String)> = params
-        .iter()
-        .map(|p| {
+    // shared overlay (app=shared 時は自分自身を 2 回重ねない)
+    let shared_params: Vec<Parameter> = if no_shared || app == "shared" {
+        Vec::new()
+    } else {
+        get_parameters_by_path(client, SHARED_PREFIX).await.unwrap_or_default()
+    };
+
+    // include-tag 追加取り込み
+    let include_tags = parse_tags(&raw_include_tags)?;
+    let tag_params: Vec<Parameter> = if include_tags.is_empty() {
+        Vec::new()
+    } else {
+        let names = names_filtered_by_tags(client, &include_tags).await?;
+        // app 本体と shared と重複する name は除外（下で優先ルールがあるが無駄取得を避ける）
+        let app_names: std::collections::HashSet<&str> = app_params
+            .iter()
+            .chain(shared_params.iter())
+            .filter_map(|p| p.name())
+            .collect();
+        let distinct: Vec<String> = names.into_iter().filter(|n| !app_names.contains(n.as_str())).collect();
+        if distinct.is_empty() {
+            Vec::new()
+        } else {
+            get_parameters_by_names(client, &distinct).await?
+        }
+    };
+
+    if app_params.is_empty() && shared_params.is_empty() && tag_params.is_empty() {
+        bail!("no parameters for sync (prefix={}, shared={}, include-tags={:?})",
+              prefix, !no_shared, raw_include_tags);
+    }
+
+    // 優先順位: app > include-tag > shared
+    // (左から右へ merge していき、同じ env key を後から上書き → 最終的に app が勝つには
+    //  shared → include-tag → app の順で挿入する)
+    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new(); // key → (value, source)
+
+    let ingest = |merged: &mut BTreeMap<String, (String, String)>,
+                  params: &[Parameter],
+                  strip_prefix: &str,
+                  source: &str| {
+        for p in params {
             let name = p.name().unwrap_or_default();
-            let key = ssm_name_to_env_key(name, &prefix);
+            let key = ssm_name_to_env_key(name, strip_prefix);
             let value = p.value().unwrap_or_default().to_string();
-            (key, value)
-        })
-        .collect();
+            merged.insert(key, (value, source.to_string()));
+        }
+    };
+
+    // shared (lowest priority)
+    if !shared_params.is_empty() {
+        ingest(&mut merged, &shared_params, SHARED_PREFIX, "shared");
+    }
+    // include-tag params (各 name の prefix は一律ではないので、parameter name 末尾で key 化)
+    for p in &tag_params {
+        let name = p.name().unwrap_or_default();
+        // 末尾セグメントベース: /amu-revo/<whatever>/a/b/c → A_B_C
+        let rest = name
+            .strip_prefix(&format!("{}/", PREFIX_ROOT))
+            .unwrap_or(name);
+        // 最初の segment (app name) をスキップ
+        let after_app = rest.splitn(2, '/').nth(1).unwrap_or(rest);
+        let key = after_app.replace(['/', '-'], "_").to_uppercase();
+        let value = p.value().unwrap_or_default().to_string();
+        // shared がカバーしたならスキップ (app 優先は後で処理)
+        merged.entry(key).and_modify(|e| *e = (value.clone(), "tag".to_string()))
+            .or_insert_with(|| (value, "tag".to_string()));
+    }
+    // app (highest priority)
+    ingest(&mut merged, &app_params, &prefix, "app");
+
+    // 衝突検出: app が shared/tag を override した key を warning 表示
+    // 厳密には ingest 前後の source を比較する必要があるので再計算
+    let mut conflicts: Vec<String> = Vec::new();
+    let mut app_keys = std::collections::HashSet::new();
+    for p in &app_params {
+        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), &prefix);
+        app_keys.insert(key);
+    }
+    let mut shared_keys = std::collections::HashSet::new();
+    for p in &shared_params {
+        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), SHARED_PREFIX);
+        shared_keys.insert(key);
+    }
+    for k in &app_keys {
+        if shared_keys.contains(k) {
+            conflicts.push(k.clone());
+        }
+    }
+
+    if !conflicts.is_empty() {
+        eprintln!(
+            "{} {} shared key(s) overridden by app: {}",
+            "warning:".yellow().bold(),
+            conflicts.len(),
+            conflicts.join(", ")
+        );
+    }
+
+    let mut entries: Vec<(String, String)> = merged.into_iter().map(|(k, (v, _))| (k, v)).collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let body: String = entries.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
 
     let existing = std::fs::read_to_string(&out).ok();
     if existing.as_deref() == Some(body.as_str()) {
-        println!("ssmm: no change ({} variables)", entries.len());
+        println!(
+            "ssmm: no change ({} variables; app={}, shared={}, tag={})",
+            entries.len(),
+            app_params.len(),
+            shared_params.len(),
+            tag_params.len()
+        );
         return Ok(());
     }
 
@@ -644,9 +793,12 @@ async fn cmd_sync(client: &Client, app: Option<String>, out: PathBuf) -> Result<
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&tmp, &out)?;
     println!(
-        "ssmm: wrote {} variables to {}",
+        "ssmm: wrote {} variables to {} (app={}, shared={}, tag={})",
         entries.len(),
-        out.display()
+        out.display(),
+        app_params.len(),
+        shared_params.len(),
+        tag_params.len()
     );
     Ok(())
 }
@@ -807,5 +959,79 @@ async fn cmd_check(
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_tag(client: &Client, action: TagAction) -> Result<()> {
+    match action {
+        TagAction::Add { key, tags, app } => {
+            let name = resolve_param_name(&key, app)?;
+            let tag_pairs = parse_tags(&tags)?;
+            if tag_pairs.iter().any(|(k, _)| k == "app") {
+                bail!("`app` tag is reserved; cannot add via `ssmm tag add`");
+            }
+            let tag_objs: Vec<Tag> = tag_pairs
+                .iter()
+                .map(|(k, v)| {
+                    Tag::builder()
+                        .key(k)
+                        .value(v)
+                        .build()
+                        .map_err(|e| anyhow!("build tag {}={}: {}", k, v, e))
+                })
+                .collect::<Result<_>>()?;
+            client
+                .add_tags_to_resource()
+                .resource_type(ResourceTypeForTagging::Parameter)
+                .resource_id(&name)
+                .set_tags(Some(tag_objs))
+                .send()
+                .await
+                .with_context(|| format!("add tags to {}", name))?;
+            println!(
+                "  ✓ tagged {} with {}",
+                name,
+                tag_pairs
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        TagAction::Remove { key, tag_keys, app } => {
+            let name = resolve_param_name(&key, app)?;
+            if tag_keys.iter().any(|k| k == "app") {
+                bail!("`app` tag is reserved; cannot remove");
+            }
+            client
+                .remove_tags_from_resource()
+                .resource_type(ResourceTypeForTagging::Parameter)
+                .resource_id(&name)
+                .set_tag_keys(Some(tag_keys.clone()))
+                .send()
+                .await
+                .with_context(|| format!("remove tags from {}", name))?;
+            println!("  ✓ removed tags {:?} from {}", tag_keys, name);
+        }
+        TagAction::List { key, app } => {
+            let name = resolve_param_name(&key, app)?;
+            let res = client
+                .list_tags_for_resource()
+                .resource_type(ResourceTypeForTagging::Parameter)
+                .resource_id(&name)
+                .send()
+                .await
+                .with_context(|| format!("list tags for {}", name))?;
+            println!("{}", format!("# {}", name).dimmed());
+            let tags = res.tag_list.unwrap_or_default();
+            if tags.is_empty() {
+                println!("  (no tags)");
+            } else {
+                for t in tags {
+                    println!("  {}={}", t.key, t.value);
+                }
+            }
+        }
+    }
     Ok(())
 }
