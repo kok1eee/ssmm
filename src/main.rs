@@ -6,6 +6,23 @@ use aws_sdk_ssm::types::{
 use clap::{ArgAction, Parser, Subcommand};
 use colored::Colorize;
 use futures::future::try_join_all;
+use futures::stream::{self, StreamExt, TryStreamExt};
+
+/// AWS SSM の標準パラメータは PutParameter が低 TPS で throttle される。
+/// 並列上限をかけて安全側に倒す（get 系は 10 でも平気だが、write 系は 3 推奨）
+const WRITE_CONCURRENCY: usize = 3;
+const READ_CONCURRENCY: usize = 10;
+
+async fn run_bounded<F, Fut, T>(futs: F, limit: usize) -> Result<Vec<T>>
+where
+    F: IntoIterator<Item = Fut>,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    stream::iter(futs)
+        .buffer_unordered(limit)
+        .try_collect()
+        .await
+}
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
@@ -136,7 +153,13 @@ enum TagAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .retry_config(
+            aws_config::retry::RetryConfig::adaptive()
+                .with_max_attempts(10),
+        )
+        .load()
+        .await;
     let client = Client::new(&config);
 
     match cli.command {
@@ -371,7 +394,7 @@ async fn get_parameters_by_names(client: &Client, names: &[String]) -> Result<Ve
                 .context("get_parameters")
         }
     });
-    let results = try_join_all(futs).await?;
+    let results = run_bounded(futs, READ_CONCURRENCY).await?;
     Ok(results
         .into_iter()
         .flat_map(|r| r.parameters.unwrap_or_default())
@@ -393,7 +416,7 @@ async fn delete_parameters_batched(client: &Client, names: &[String]) -> Result<
                 .context("delete_parameters")
         }
     });
-    let results = try_join_all(futs).await?;
+    let results = run_bounded(futs, WRITE_CONCURRENCY).await?;
     Ok(results
         .into_iter()
         .flat_map(|r| r.deleted_parameters.unwrap_or_default())
@@ -498,13 +521,26 @@ async fn cmd_put(
     let app = resolve_app(app)?;
     let prefix = app_prefix(&app);
 
-    let kvs: Vec<(String, String)> = if let Some(path) = env {
+    let mut kvs: Vec<(String, String)> = if let Some(path) = env {
         read_env_file(&path)?
     } else if !pairs.is_empty() {
         parse_kv_pairs(&pairs)?
     } else {
         bail!("either --env <file> or KEY=VALUE arguments are required");
     };
+    // SSM は空文字列を許容しない。空値は skip して警告
+    let before = kvs.len();
+    kvs.retain(|(k, v)| {
+        if v.is_empty() {
+            eprintln!("  {} empty value, skipped: {}", "warning:".yellow().bold(), k);
+            false
+        } else {
+            true
+        }
+    });
+    if kvs.len() < before {
+        eprintln!("  ({} key(s) skipped due to empty value)", before - kvs.len());
+    }
     if kvs.is_empty() {
         bail!("no key=value to put");
     }
@@ -551,7 +587,7 @@ async fn cmd_put(
             Ok::<_, anyhow::Error>((name, ptype, key, value.len()))
         }
     });
-    let results = try_join_all(futs).await?;
+    let results = run_bounded(futs, WRITE_CONCURRENCY).await?;
 
     let tag_note = if extra_tags.is_empty() {
         String::new()
@@ -841,7 +877,7 @@ async fn cmd_migrate(
             Ok::<_, anyhow::Error>((old_name, new_name))
         }
     });
-    let migrated = try_join_all(futs).await?;
+    let migrated = run_bounded(futs, WRITE_CONCURRENCY).await?;
     for (old, new) in &migrated {
         println!("  ✓ {} → {}", old, new);
     }
