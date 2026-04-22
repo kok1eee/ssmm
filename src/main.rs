@@ -1,8 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use aws_sdk_ssm::Client;
-use aws_sdk_ssm::types::{ParameterType, ResourceTypeForTagging, Tag};
-use clap::{Parser, Subcommand};
+use aws_sdk_ssm::types::{
+    Parameter, ParameterStringFilter, ParameterType, ResourceTypeForTagging, Tag,
+};
+use clap::{ArgAction, Parser, Subcommand};
 use colored::Colorize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -29,6 +32,9 @@ enum Command {
         /// Hide values (show keys only)
         #[arg(long)]
         keys_only: bool,
+        /// Filter by tag (repeatable: --tag env=prod --tag owner=backend)
+        #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+        tags: Vec<String>,
     },
     /// Put parameters from .env or KEY=VALUE pairs
     Put {
@@ -42,17 +48,18 @@ enum Command {
         /// Force all values to be stored as String (no SecureString auto-detect)
         #[arg(long)]
         plain: bool,
+        /// Extra tags (repeatable: --tag env=prod --tag owner=backend)
+        /// `app` tag is always attached automatically.
+        #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+        tags: Vec<String>,
     },
     /// Delete parameters
     Delete {
-        /// Key name (relative to app prefix) or absolute path to delete
         target: String,
         #[arg(long)]
         app: Option<String>,
-        /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Treat target as prefix and recurse
         #[arg(long, short)]
         recursive: bool,
     },
@@ -73,18 +80,22 @@ enum Command {
     },
     /// Migrate parameters from an old prefix to a new prefix
     Migrate {
-        /// Old prefix, e.g. /amu/hikken-schedule
         old_prefix: String,
-        /// New prefix, e.g. /amu-revo/hikken-schedule
         new_prefix: String,
-        /// Delete old parameters after successful migration
         #[arg(long)]
         delete_old: bool,
     },
-    /// Check for duplicate keys across apps
+    /// Check for duplicate keys or identical values across apps
     Check {
+        /// Find keys that exist in multiple apps (same trailing key name)
         #[arg(long)]
         duplicates: bool,
+        /// Find parameters sharing the same value (candidates for consolidation)
+        #[arg(long)]
+        values: bool,
+        /// Reveal actual values in --values output (default: SHA-256 prefix only)
+        #[arg(long)]
+        show_values: bool,
     },
 }
 
@@ -95,8 +106,12 @@ async fn main() -> Result<()> {
     let client = Client::new(&config);
 
     match cli.command {
-        Command::List { app, all, keys_only } => cmd_list(&client, app, all, keys_only).await,
-        Command::Put { pairs, env, app, plain } => cmd_put(&client, pairs, env, app, plain).await,
+        Command::List { app, all, keys_only, tags } => {
+            cmd_list(&client, app, all, keys_only, tags).await
+        }
+        Command::Put { pairs, env, app, plain, tags } => {
+            cmd_put(&client, pairs, env, app, plain, tags).await
+        }
         Command::Delete { target, app, yes, recursive } => {
             cmd_delete(&client, target, app, yes, recursive).await
         }
@@ -106,7 +121,9 @@ async fn main() -> Result<()> {
         Command::Migrate { old_prefix, new_prefix, delete_old } => {
             cmd_migrate(&client, old_prefix, new_prefix, delete_old).await
         }
-        Command::Check { duplicates } => cmd_check(&client, duplicates).await,
+        Command::Check { duplicates, values, show_values } => {
+            cmd_check(&client, duplicates, values, show_values).await
+        }
     }
 }
 
@@ -130,23 +147,16 @@ fn app_prefix(app: &str) -> String {
     format!("{}/{}", PREFIX_ROOT, app)
 }
 
-/// SSM name "/amu-revo/hikken-schedule/kintone-id" + prefix "/amu-revo/hikken-schedule"
-/// → "KINTONE_ID"
 fn ssm_name_to_env_key(name: &str, prefix: &str) -> String {
     let trimmed_prefix = format!("{}/", prefix.trim_end_matches('/'));
     let rest = name.strip_prefix(&trimmed_prefix).unwrap_or(name);
     rest.replace(['/', '-'], "_").to_uppercase()
 }
 
-/// env key "KINTONE_ID" → SSM tail "kintone-id"
 fn env_key_to_ssm_tail(key: &str) -> String {
     key.to_lowercase().replace('_', "-")
 }
 
-/// key 名から SecureString か String かを自動判定
-/// - "webhook" を含む → SecureString
-/// - 非 secret を示唆する suffix (_path, _url, _channel, etc.) → String
-/// - それ以外 → SecureString (保守的)
 fn should_be_secure(key: &str) -> bool {
     let lc = key.to_lowercase();
     if lc.contains("webhook") {
@@ -191,10 +201,23 @@ fn parse_kv_pairs(pairs: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-async fn get_parameters_by_path(
-    client: &Client,
-    prefix: &str,
-) -> Result<Vec<aws_sdk_ssm::types::Parameter>> {
+fn parse_tags(raw: &[String]) -> Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|s| {
+            s.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .ok_or_else(|| anyhow!("invalid tag (need KEY=VALUE): {}", s))
+        })
+        .collect()
+}
+
+fn hash8(value: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(value.as_bytes());
+    format!("{:x}", h.finalize())[..8].to_string()
+}
+
+async fn get_parameters_by_path(client: &Client, prefix: &str) -> Result<Vec<Parameter>> {
     let mut all = Vec::new();
     let mut next: Option<String> = None;
     loop {
@@ -218,6 +241,60 @@ async fn get_parameters_by_path(
     Ok(all)
 }
 
+/// タグで絞り込んだ parameter の名前集合を返す（DescribeParameters は値を返さない）
+async fn names_filtered_by_tags(
+    client: &Client,
+    tag_filters: &[(String, String)],
+) -> Result<Vec<String>> {
+    let filters: Vec<ParameterStringFilter> = tag_filters
+        .iter()
+        .map(|(k, v)| {
+            ParameterStringFilter::builder()
+                .key(format!("tag:{}", k))
+                .option("Equals")
+                .values(v.clone())
+                .build()
+                .map_err(|e| anyhow!("build tag filter: {}", e))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut names = Vec::new();
+    let mut next: Option<String> = None;
+    loop {
+        let mut req = client.describe_parameters().set_parameter_filters(Some(filters.clone()));
+        if let Some(t) = &next {
+            req = req.next_token(t);
+        }
+        let res = req.send().await.context("describe_parameters with tag filter")?;
+        if let Some(ps) = res.parameters {
+            names.extend(ps.into_iter().filter_map(|p| p.name));
+        }
+        match res.next_token {
+            Some(t) => next = Some(t),
+            None => break,
+        }
+    }
+    Ok(names)
+}
+
+/// 名前集合から値付き Parameter を取る (GetParameters は 10件/呼)
+async fn get_parameters_by_names(client: &Client, names: &[String]) -> Result<Vec<Parameter>> {
+    let mut out = Vec::new();
+    for chunk in names.chunks(10) {
+        let res = client
+            .get_parameters()
+            .set_names(Some(chunk.to_vec()))
+            .with_decryption(true)
+            .send()
+            .await
+            .context("get_parameters")?;
+        if let Some(ps) = res.parameters {
+            out.extend(ps);
+        }
+    }
+    Ok(out)
+}
+
 fn confirm_prompt(msg: &str) -> Result<bool> {
     print!("{} [y/N]: ", msg);
     io::stdout().flush()?;
@@ -228,7 +305,13 @@ fn confirm_prompt(msg: &str) -> Result<bool> {
 
 // ---------- commands ----------
 
-async fn cmd_list(client: &Client, app: Option<String>, all: bool, keys_only: bool) -> Result<()> {
+async fn cmd_list(
+    client: &Client,
+    app: Option<String>,
+    all: bool,
+    keys_only: bool,
+    raw_tags: Vec<String>,
+) -> Result<()> {
     let prefix = if all {
         PREFIX_ROOT.to_string()
     } else {
@@ -239,14 +322,32 @@ async fn cmd_list(client: &Client, app: Option<String>, all: bool, keys_only: bo
         app_prefix(&a)
     };
 
-    let params = get_parameters_by_path(client, &prefix).await?;
+    let tag_filters = parse_tags(&raw_tags)?;
+
+    // tag フィルタがあれば DescribeParameters → prefix 絞り込み → GetParameters
+    // なければ普通に GetParametersByPath
+    let params: Vec<Parameter> = if tag_filters.is_empty() {
+        get_parameters_by_path(client, &prefix).await?
+    } else {
+        let names = names_filtered_by_tags(client, &tag_filters).await?;
+        let prefix_slash = format!("{}/", prefix.trim_end_matches('/'));
+        let filtered: Vec<String> = names
+            .into_iter()
+            .filter(|n| n == &prefix || n.starts_with(&prefix_slash))
+            .collect();
+        if filtered.is_empty() {
+            println!("(no parameters match tag filter under {})", prefix.dimmed());
+            return Ok(());
+        }
+        get_parameters_by_names(client, &filtered).await?
+    };
+
     if params.is_empty() {
         println!("(no parameters under {})", prefix.dimmed());
         return Ok(());
     }
 
     if all {
-        // group by app (2nd segment under /amu-revo/)
         let mut by_app: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
@@ -300,6 +401,7 @@ async fn cmd_put(
     env: Option<PathBuf>,
     app: Option<String>,
     plain: bool,
+    raw_tags: Vec<String>,
 ) -> Result<()> {
     let app = match app {
         Some(a) => a,
@@ -317,6 +419,13 @@ async fn cmd_put(
 
     if kvs.is_empty() {
         bail!("no key=value to put");
+    }
+
+    let extra_tags = parse_tags(&raw_tags)?;
+
+    // tag の衝突チェック: app を user 指定で上書きできないようにする
+    if extra_tags.iter().any(|(k, _)| k == "app") {
+        bail!("`app` tag is reserved; do not pass --tag app=...");
     }
 
     for (k, v) in &kvs {
@@ -337,15 +446,29 @@ async fn cmd_put(
             .await
             .with_context(|| format!("put-parameter {}", name))?;
 
-        // tag (app) — overwrite でなければ put-parameter 時に --tags を載せられるが、
-        // 冪等に扱うため後付けする
-        let tag = Tag::builder().key("app").value(&app).build()
-            .map_err(|e| anyhow!("build tag: {}", e))?;
+        // tag: app + 任意タグ
+        let mut tag_objs: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
+        tag_objs.push(
+            Tag::builder()
+                .key("app")
+                .value(&app)
+                .build()
+                .map_err(|e| anyhow!("build app tag: {}", e))?,
+        );
+        for (tk, tv) in &extra_tags {
+            tag_objs.push(
+                Tag::builder()
+                    .key(tk)
+                    .value(tv)
+                    .build()
+                    .map_err(|e| anyhow!("build tag {}={}: {}", tk, tv, e))?,
+            );
+        }
         let _ = client
             .add_tags_to_resource()
             .resource_type(ResourceTypeForTagging::Parameter)
             .resource_id(&name)
-            .tags(tag)
+            .set_tags(Some(tag_objs))
             .send()
             .await;
 
@@ -353,7 +476,19 @@ async fn cmd_put(
             ParameterType::SecureString => "SecureString".yellow(),
             _ => "String".green(),
         };
-        println!("  ✓ {} ({}, len={})", name, type_label, v.len());
+        let tag_note = if extra_tags.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " +tags[{}]",
+                extra_tags
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        println!("  ✓ {} ({}, len={}){}", name, type_label, v.len(), tag_note);
     }
     Ok(())
 }
@@ -365,7 +500,6 @@ async fn cmd_delete(
     yes: bool,
     recursive: bool,
 ) -> Result<()> {
-    // target が絶対パス (/で始まる) ならそのまま、そうでなければ app prefix 下とみなす
     let absolute = if target.starts_with('/') {
         target.clone()
     } else {
@@ -377,7 +511,6 @@ async fn cmd_delete(
     };
 
     if recursive {
-        // prefix 配下を全削除
         let params = get_parameters_by_path(client, &absolute).await?;
         if params.is_empty() {
             println!("(no parameters under {})", absolute);
@@ -391,7 +524,6 @@ async fn cmd_delete(
             println!("aborted.");
             return Ok(());
         }
-        // batch delete (max 10)
         let names: Vec<String> = params
             .iter()
             .filter_map(|p| p.name().map(|s| s.to_string()))
@@ -501,14 +633,12 @@ async fn cmd_sync(client: &Client, app: Option<String>, out: PathBuf) -> Result<
 
     let body: String = entries.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
 
-    // compare with existing
     let existing = std::fs::read_to_string(&out).ok();
     if existing.as_deref() == Some(body.as_str()) {
         println!("ssmm: no change ({} variables)", entries.len());
         return Ok(());
     }
 
-    // atomic-ish write with 600
     let tmp = out.with_extension("env.tmp");
     std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
@@ -558,12 +688,14 @@ async fn cmd_migrate(
             .await
             .with_context(|| format!("put {}", new_name))?;
 
-        // tag: app = 2nd segment of new prefix
         if let Some(new_app) = new_prefix
             .strip_prefix(&format!("{}/", PREFIX_ROOT))
             .map(|s| s.split('/').next().unwrap_or(s).to_string())
         {
-            let tag = Tag::builder().key("app").value(&new_app).build()
+            let tag = Tag::builder()
+                .key("app")
+                .value(&new_app)
+                .build()
                 .map_err(|e| anyhow!("build tag: {}", e))?;
             let _ = client
                 .add_tags_to_resource()
@@ -599,36 +731,81 @@ async fn cmd_migrate(
     Ok(())
 }
 
-async fn cmd_check(client: &Client, duplicates: bool) -> Result<()> {
-    let params = get_parameters_by_path(client, PREFIX_ROOT).await?;
-    if !duplicates {
-        println!("(nothing to check; pass --duplicates)");
+async fn cmd_check(
+    client: &Client,
+    duplicates: bool,
+    values: bool,
+    show_values: bool,
+) -> Result<()> {
+    if !duplicates && !values {
+        println!("(nothing to check; pass --duplicates and/or --values)");
         return Ok(());
     }
 
-    // key (最後のセグメント) でグループ化
-    let mut by_tail: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for p in &params {
-        let name = p.name().unwrap_or_default();
-        let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
-        let (app, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        by_tail.entry(tail.to_string()).or_default().push(app.to_string());
+    let params = get_parameters_by_path(client, PREFIX_ROOT).await?;
+    if params.is_empty() {
+        println!("(no parameters under {})", PREFIX_ROOT);
+        return Ok(());
     }
 
-    let mut found_any = false;
-    for (tail, apps) in &by_tail {
-        if apps.len() >= 2 {
-            found_any = true;
-            println!(
-                "{}: {} [{} apps]",
-                tail.yellow().bold(),
-                apps.join(", "),
-                apps.len()
-            );
+    if duplicates {
+        let mut by_tail: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for p in &params {
+            let name = p.name().unwrap_or_default();
+            let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
+            let (app, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            by_tail.entry(tail.to_string()).or_default().push(app.to_string());
+        }
+        println!("{}", "[key-name duplicates]".bold());
+        let mut found = false;
+        for (tail, apps) in &by_tail {
+            if apps.len() >= 2 {
+                found = true;
+                println!(
+                    "  {}: {} [{} apps]",
+                    tail.yellow().bold(),
+                    apps.join(", "),
+                    apps.len()
+                );
+            }
+        }
+        if !found {
+            println!("  no duplicates.");
         }
     }
-    if !found_any {
-        println!("no duplicates.");
+
+    if values {
+        if duplicates {
+            println!();
+        }
+        println!("{}", "[value duplicates]".bold());
+        let mut by_value: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for p in &params {
+            let name = p.name().unwrap_or_default().to_string();
+            let value = p.value().unwrap_or_default().to_string();
+            by_value.entry(value).or_default().push(name);
+        }
+        let mut found = false;
+        let groups: Vec<_> = by_value
+            .iter()
+            .filter(|(_, names)| names.len() >= 2)
+            .collect();
+        for (value, names) in groups {
+            found = true;
+            let display = if show_values {
+                value.clone()
+            } else {
+                format!("sha256={} len={}", hash8(value), value.len())
+            };
+            println!("  {} [{} parameters]", display.yellow().bold(), names.len());
+            for n in names {
+                println!("    - {}", n);
+            }
+        }
+        if !found {
+            println!("  no value duplicates.");
+        }
     }
+
     Ok(())
 }
