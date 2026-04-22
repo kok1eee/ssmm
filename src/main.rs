@@ -5,8 +5,9 @@ use aws_sdk_ssm::types::{
 };
 use clap::{ArgAction, Parser, Subcommand};
 use colored::Colorize;
+use futures::future::try_join_all;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -94,10 +95,8 @@ enum Command {
     },
     /// Check for duplicate keys or identical values across apps
     Check {
-        /// Find keys that exist in multiple apps (same trailing key name)
         #[arg(long)]
         duplicates: bool,
-        /// Find parameters sharing the same value (candidates for consolidation)
         #[arg(long)]
         values: bool,
         /// Reveal actual values in --values output (default: SHA-256 prefix only)
@@ -113,29 +112,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum TagAction {
-    /// Add tags to a parameter
     Add {
-        /// Parameter key (relative to app) or absolute path (starts with /)
         key: String,
-        /// Tags to add
         #[arg(value_name = "KEY=VALUE", required = true)]
         tags: Vec<String>,
         #[arg(long)]
         app: Option<String>,
     },
-    /// Remove tags from a parameter
     Remove {
-        /// Parameter key (relative to app) or absolute path (starts with /)
         key: String,
-        /// Tag keys to remove (space-separated)
         #[arg(value_name = "TAG_KEY", required = true)]
         tag_keys: Vec<String>,
         #[arg(long)]
         app: Option<String>,
     },
-    /// List tags on a parameter
     List {
-        /// Parameter key (relative to app) or absolute path (starts with /)
         key: String,
         #[arg(long)]
         app: Option<String>,
@@ -182,21 +173,38 @@ fn detect_app_from_cwd() -> Result<String> {
         .ok_or_else(|| anyhow!("cannot determine CWD basename"))?
         .to_string_lossy()
         .into_owned();
-    Ok(snake_to_dash(&name))
+    Ok(name.replace('_', "-"))
 }
 
-fn snake_to_dash(s: &str) -> String {
-    s.replace('_', "-")
+fn resolve_app(app: Option<String>) -> Result<String> {
+    match app {
+        Some(a) => Ok(a),
+        None => detect_app_from_cwd(),
+    }
 }
 
 fn app_prefix(app: &str) -> String {
     format!("{}/{}", PREFIX_ROOT, app)
 }
 
+fn resolve_param_name(key: &str, app: Option<String>) -> Result<String> {
+    if key.starts_with('/') {
+        return Ok(key.to_string());
+    }
+    Ok(format!("{}/{}", app_prefix(&resolve_app(app)?), env_key_to_ssm_tail(key)))
+}
+
 fn ssm_name_to_env_key(name: &str, prefix: &str) -> String {
     let trimmed_prefix = format!("{}/", prefix.trim_end_matches('/'));
     let rest = name.strip_prefix(&trimmed_prefix).unwrap_or(name);
     rest.replace(['/', '-'], "_").to_uppercase()
+}
+
+/// /amu-revo/<app>/<tail...> → <TAIL_UPCASE_UNDERSCORED>   (app セグメントを落とす)
+fn ssm_name_to_env_key_from_root(name: &str) -> String {
+    let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
+    let after_app = rest.splitn(2, '/').nth(1).unwrap_or("");
+    after_app.replace(['/', '-'], "_").to_uppercase()
 }
 
 fn env_key_to_ssm_tail(key: &str) -> String {
@@ -215,6 +223,18 @@ fn should_be_secure(key: &str) -> bool {
         return false;
     }
     true
+}
+
+fn build_tag(k: &str, v: &str) -> Result<Tag> {
+    Tag::builder()
+        .key(k)
+        .value(v)
+        .build()
+        .map_err(|e| anyhow!("build tag {}={}: {}", k, v, e))
+}
+
+fn build_tags(pairs: &[(String, String)]) -> Result<Vec<Tag>> {
+    pairs.iter().map(|(k, v)| build_tag(k, v)).collect()
 }
 
 fn read_env_file(path: &Path) -> Result<Vec<(String, String)>> {
@@ -263,18 +283,6 @@ fn hash8(value: &str) -> String {
     format!("{:x}", h.finalize())[..8].to_string()
 }
 
-/// parameter key 名 (absolute or relative) を SSM name に解決
-fn resolve_param_name(key: &str, app: Option<String>) -> Result<String> {
-    if key.starts_with('/') {
-        return Ok(key.to_string());
-    }
-    let a = match app {
-        Some(a) => a,
-        None => detect_app_from_cwd()?,
-    };
-    Ok(format!("{}/{}", app_prefix(&a), env_key_to_ssm_tail(key)))
-}
-
 async fn get_parameters_by_path(client: &Client, prefix: &str) -> Result<Vec<Parameter>> {
     let mut all = Vec::new();
     let mut next: Option<String> = None;
@@ -299,21 +307,34 @@ async fn get_parameters_by_path(client: &Client, prefix: &str) -> Result<Vec<Par
     Ok(all)
 }
 
+/// タグフィルタで parameter name を取得。path_prefix を渡すと SSM 側で prefix 絞り込み
+/// (Path + Recursive) を併用し、クライアント側の post-filter を不要にする。
 async fn names_filtered_by_tags(
     client: &Client,
     tag_filters: &[(String, String)],
+    path_prefix: Option<&str>,
 ) -> Result<Vec<String>> {
-    let filters: Vec<ParameterStringFilter> = tag_filters
-        .iter()
-        .map(|(k, v)| {
+    let mut filters: Vec<ParameterStringFilter> = Vec::with_capacity(tag_filters.len() + 1);
+    if let Some(p) = path_prefix {
+        filters.push(
+            ParameterStringFilter::builder()
+                .key("Path")
+                .option("Recursive")
+                .values(p)
+                .build()
+                .map_err(|e| anyhow!("build Path filter: {}", e))?,
+        );
+    }
+    for (k, v) in tag_filters {
+        filters.push(
             ParameterStringFilter::builder()
                 .key(format!("tag:{}", k))
                 .option("Equals")
                 .values(v.clone())
                 .build()
-                .map_err(|e| anyhow!("build tag filter: {}", e))
-        })
-        .collect::<Result<_>>()?;
+                .map_err(|e| anyhow!("build tag filter: {}", e))?,
+        );
+    }
 
     let mut names = Vec::new();
     let mut next: Option<String> = None;
@@ -322,7 +343,7 @@ async fn names_filtered_by_tags(
         if let Some(t) = &next {
             req = req.next_token(t);
         }
-        let res = req.send().await.context("describe_parameters with tag filter")?;
+        let res = req.send().await.context("describe_parameters with filters")?;
         if let Some(ps) = res.parameters {
             names.extend(ps.into_iter().filter_map(|p| p.name));
         }
@@ -335,20 +356,48 @@ async fn names_filtered_by_tags(
 }
 
 async fn get_parameters_by_names(client: &Client, names: &[String]) -> Result<Vec<Parameter>> {
-    let mut out = Vec::new();
-    for chunk in names.chunks(10) {
-        let res = client
-            .get_parameters()
-            .set_names(Some(chunk.to_vec()))
-            .with_decryption(true)
-            .send()
-            .await
-            .context("get_parameters")?;
-        if let Some(ps) = res.parameters {
-            out.extend(ps);
-        }
+    if names.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(out)
+    let futs = names.chunks(10).map(|chunk| {
+        let chunk = chunk.to_vec();
+        async move {
+            client
+                .get_parameters()
+                .set_names(Some(chunk))
+                .with_decryption(true)
+                .send()
+                .await
+                .context("get_parameters")
+        }
+    });
+    let results = try_join_all(futs).await?;
+    Ok(results
+        .into_iter()
+        .flat_map(|r| r.parameters.unwrap_or_default())
+        .collect())
+}
+
+async fn delete_parameters_batched(client: &Client, names: &[String]) -> Result<Vec<String>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let futs = names.chunks(10).map(|chunk| {
+        let chunk = chunk.to_vec();
+        async move {
+            client
+                .delete_parameters()
+                .set_names(Some(chunk))
+                .send()
+                .await
+                .context("delete_parameters")
+        }
+    });
+    let results = try_join_all(futs).await?;
+    Ok(results
+        .into_iter()
+        .flat_map(|r| r.deleted_parameters.unwrap_or_default())
+        .collect())
 }
 
 fn confirm_prompt(msg: &str) -> Result<bool> {
@@ -361,6 +410,15 @@ fn confirm_prompt(msg: &str) -> Result<bool> {
 
 // ---------- commands ----------
 
+fn print_entry(key: &str, value: Option<&str>, secure: bool, keys_only: bool, indent: &str) {
+    let label = if secure { "🔒" } else { "  " };
+    if keys_only {
+        println!("{}{} {}", indent, label, key);
+    } else {
+        println!("{}{} {}={}", indent, label, key, value.unwrap_or(""));
+    }
+}
+
 async fn cmd_list(
     client: &Client,
     app: Option<String>,
@@ -371,11 +429,7 @@ async fn cmd_list(
     let prefix = if all {
         PREFIX_ROOT.to_string()
     } else {
-        let a = match app {
-            Some(a) => a,
-            None => detect_app_from_cwd()?,
-        };
-        app_prefix(&a)
+        app_prefix(&resolve_app(app)?)
     };
 
     let tag_filters = parse_tags(&raw_tags)?;
@@ -383,17 +437,12 @@ async fn cmd_list(
     let params: Vec<Parameter> = if tag_filters.is_empty() {
         get_parameters_by_path(client, &prefix).await?
     } else {
-        let names = names_filtered_by_tags(client, &tag_filters).await?;
-        let prefix_slash = format!("{}/", prefix.trim_end_matches('/'));
-        let filtered: Vec<String> = names
-            .into_iter()
-            .filter(|n| n == &prefix || n.starts_with(&prefix_slash))
-            .collect();
-        if filtered.is_empty() {
+        let names = names_filtered_by_tags(client, &tag_filters, Some(&prefix)).await?;
+        if names.is_empty() {
             println!("(no parameters match tag filter under {})", prefix.dimmed());
             return Ok(());
         }
-        get_parameters_by_names(client, &filtered).await?
+        get_parameters_by_names(client, &names).await?
     };
 
     if params.is_empty() {
@@ -406,30 +455,24 @@ async fn cmd_list(
         for p in &params {
             let name = p.name().unwrap_or_default();
             let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
-            let (app_name, tail) = rest.split_once('/').unwrap_or((rest, ""));
-            let env_key = tail.replace(['/', '-'], "_").to_uppercase();
+            let (app_name, _) = rest.split_once('/').unwrap_or((rest, ""));
+            let key = ssm_name_to_env_key_from_root(name);
             let value = p.value().unwrap_or_default().to_string();
             let secure = matches!(p.r#type(), Some(&ParameterType::SecureString));
-            by_app.entry(app_name.to_string()).or_default().push((env_key, value, secure));
+            by_app.entry(app_name.to_string()).or_default().push((key, value, secure));
         }
         for (app_name, mut entries) in by_app {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             println!("{}", format!("[{}]", app_name).bold().cyan());
             for (k, v, secure) in entries {
-                let label = if secure { "🔒" } else { "  " };
-                if keys_only {
-                    println!("  {} {}", label, k);
-                } else {
-                    println!("  {} {}={}", label, k, v);
-                }
+                print_entry(&k, Some(&v), secure, keys_only, "  ");
             }
         }
     } else {
         let mut entries: Vec<(String, String, bool)> = params
             .iter()
             .map(|p| {
-                let name = p.name().unwrap_or_default();
-                let key = ssm_name_to_env_key(name, &prefix);
+                let key = ssm_name_to_env_key(p.name().unwrap_or_default(), &prefix);
                 let value = p.value().unwrap_or_default().to_string();
                 let secure = matches!(p.r#type(), Some(&ParameterType::SecureString));
                 (key, value, secure)
@@ -438,12 +481,7 @@ async fn cmd_list(
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         println!("{}", format!("# {} ({} variables)", prefix, entries.len()).dimmed());
         for (k, v, secure) in entries {
-            let label = if secure { "🔒" } else { "  " };
-            if keys_only {
-                println!("{} {}", label, k);
-            } else {
-                println!("{} {}={}", label, k, v);
-            }
+            print_entry(&k, Some(&v), secure, keys_only, "");
         }
     }
     Ok(())
@@ -457,10 +495,7 @@ async fn cmd_put(
     plain: bool,
     raw_tags: Vec<String>,
 ) -> Result<()> {
-    let app = match app {
-        Some(a) => a,
-        None => detect_app_from_cwd()?,
-    };
+    let app = resolve_app(app)?;
     let prefix = app_prefix(&app);
 
     let kvs: Vec<(String, String)> = if let Some(path) = env {
@@ -470,77 +505,72 @@ async fn cmd_put(
     } else {
         bail!("either --env <file> or KEY=VALUE arguments are required");
     };
-
     if kvs.is_empty() {
         bail!("no key=value to put");
     }
 
     let extra_tags = parse_tags(&raw_tags)?;
-
     if extra_tags.iter().any(|(k, _)| k == "app") {
         bail!("`app` tag is reserved; do not pass --tag app=...");
     }
 
-    for (k, v) in &kvs {
+    let app_tag_pair = vec![("app".to_string(), app.clone())];
+    let all_tags: Vec<(String, String)> =
+        app_tag_pair.into_iter().chain(extra_tags.iter().cloned()).collect();
+
+    let futs = kvs.iter().map(|(k, v)| {
         let name = format!("{}/{}", prefix, env_key_to_ssm_tail(k));
         let ptype = if plain || !should_be_secure(k) {
             ParameterType::String
         } else {
             ParameterType::SecureString
         };
+        let tags = all_tags.clone();
+        let key = k.clone();
+        let value = v.clone();
+        async move {
+            let tag_objs = build_tags(&tags)?;
+            client
+                .put_parameter()
+                .name(&name)
+                .value(&value)
+                .r#type(ptype.clone())
+                .overwrite(true)
+                .send()
+                .await
+                .with_context(|| format!("put-parameter {}", name))?;
 
-        client
-            .put_parameter()
-            .name(&name)
-            .value(v)
-            .r#type(ptype.clone())
-            .overwrite(true)
-            .send()
-            .await
-            .with_context(|| format!("put-parameter {}", name))?;
+            let _ = client
+                .add_tags_to_resource()
+                .resource_type(ResourceTypeForTagging::Parameter)
+                .resource_id(&name)
+                .set_tags(Some(tag_objs))
+                .send()
+                .await;
 
-        let mut tag_objs: Vec<Tag> = Vec::with_capacity(1 + extra_tags.len());
-        tag_objs.push(
-            Tag::builder()
-                .key("app")
-                .value(&app)
-                .build()
-                .map_err(|e| anyhow!("build app tag: {}", e))?,
-        );
-        for (tk, tv) in &extra_tags {
-            tag_objs.push(
-                Tag::builder()
-                    .key(tk)
-                    .value(tv)
-                    .build()
-                    .map_err(|e| anyhow!("build tag {}={}: {}", tk, tv, e))?,
-            );
+            Ok::<_, anyhow::Error>((name, ptype, key, value.len()))
         }
-        let _ = client
-            .add_tags_to_resource()
-            .resource_type(ResourceTypeForTagging::Parameter)
-            .resource_id(&name)
-            .set_tags(Some(tag_objs))
-            .send()
-            .await;
+    });
+    let results = try_join_all(futs).await?;
 
+    let tag_note = if extra_tags.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " +tags[{}]",
+            extra_tags
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    for (name, ptype, _key, len) in results {
         let type_label = match ptype {
             ParameterType::SecureString => "SecureString".yellow(),
             _ => "String".green(),
         };
-        let tag_note = if extra_tags.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " +tags[{}]",
-                extra_tags
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-        println!("  ✓ {} ({}, len={}){}", name, type_label, v.len(), tag_note);
+        println!("  ✓ {} ({}, len={}){}", name, type_label, len, tag_note);
     }
     Ok(())
 }
@@ -555,11 +585,7 @@ async fn cmd_delete(
     let absolute = if target.starts_with('/') {
         target.clone()
     } else {
-        let a = match app {
-            Some(a) => a,
-            None => detect_app_from_cwd()?,
-        };
-        format!("{}/{}", app_prefix(&a), env_key_to_ssm_tail(&target))
+        format!("{}/{}", app_prefix(&resolve_app(app)?), env_key_to_ssm_tail(&target))
     };
 
     if recursive {
@@ -580,18 +606,9 @@ async fn cmd_delete(
             .iter()
             .filter_map(|p| p.name().map(|s| s.to_string()))
             .collect();
-        for chunk in names.chunks(10) {
-            let res = client
-                .delete_parameters()
-                .set_names(Some(chunk.to_vec()))
-                .send()
-                .await?;
-            for n in res.deleted_parameters.unwrap_or_default() {
-                println!("  ✓ deleted {}", n);
-            }
-            for n in res.invalid_parameters.unwrap_or_default() {
-                println!("  ✗ invalid {}", n);
-            }
+        let deleted = delete_parameters_batched(client, &names).await?;
+        for n in deleted {
+            println!("  ✓ deleted {}", n);
         }
     } else {
         println!("delete {}", absolute.bold());
@@ -660,127 +677,92 @@ async fn cmd_sync(
     no_shared: bool,
     raw_include_tags: Vec<String>,
 ) -> Result<()> {
-    let app = match app {
-        Some(a) => a,
-        None => detect_app_from_cwd()?,
-    };
+    let app = resolve_app(app)?;
     let prefix = app_prefix(&app);
-
-    // app 本体は常に取り込み (shared と同じ app 名 = "shared" の時は衝突注意)
-    let app_params = get_parameters_by_path(client, &prefix).await?;
-    if app == "shared" {
-        // /amu-revo/shared は app namespace としては不自然、素通し許可だが overlay は抑制
-    }
-
-    // shared overlay (app=shared 時は自分自身を 2 回重ねない)
-    let shared_params: Vec<Parameter> = if no_shared || app == "shared" {
-        Vec::new()
-    } else {
-        get_parameters_by_path(client, SHARED_PREFIX).await.unwrap_or_default()
-    };
-
-    // include-tag 追加取り込み
     let include_tags = parse_tags(&raw_include_tags)?;
-    let tag_params: Vec<Parameter> = if include_tags.is_empty() {
-        Vec::new()
-    } else {
-        let names = names_filtered_by_tags(client, &include_tags).await?;
-        // app 本体と shared と重複する name は除外（下で優先ルールがあるが無駄取得を避ける）
-        let app_names: std::collections::HashSet<&str> = app_params
-            .iter()
-            .chain(shared_params.iter())
-            .filter_map(|p| p.name())
-            .collect();
-        let distinct: Vec<String> = names.into_iter().filter(|n| !app_names.contains(n.as_str())).collect();
-        if distinct.is_empty() {
-            Vec::new()
-        } else {
-            get_parameters_by_names(client, &distinct).await?
+    let want_shared = !no_shared && app != "shared";
+
+    // 3 本の SSM 問い合わせを並列化 (hot path)
+    let (app_params, shared_params, tag_names) = tokio::try_join!(
+        get_parameters_by_path(client, &prefix),
+        async {
+            if want_shared {
+                get_parameters_by_path(client, SHARED_PREFIX).await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        async {
+            if include_tags.is_empty() {
+                Ok(Vec::new())
+            } else {
+                names_filtered_by_tags(client, &include_tags, Some(PREFIX_ROOT)).await
+            }
         }
-    };
+    )?;
+
+    // tag_names から app/shared と重複する name を除いた残りを取得
+    let already: HashSet<&str> = app_params
+        .iter()
+        .chain(shared_params.iter())
+        .filter_map(|p| p.name())
+        .collect();
+    let tag_param_names: Vec<String> =
+        tag_names.into_iter().filter(|n| !already.contains(n.as_str())).collect();
+    let tag_params = get_parameters_by_names(client, &tag_param_names).await?;
 
     if app_params.is_empty() && shared_params.is_empty() && tag_params.is_empty() {
-        bail!("no parameters for sync (prefix={}, shared={}, include-tags={:?})",
-              prefix, !no_shared, raw_include_tags);
-    }
-
-    // 優先順位: app > include-tag > shared
-    // (左から右へ merge していき、同じ env key を後から上書き → 最終的に app が勝つには
-    //  shared → include-tag → app の順で挿入する)
-    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new(); // key → (value, source)
-
-    let ingest = |merged: &mut BTreeMap<String, (String, String)>,
-                  params: &[Parameter],
-                  strip_prefix: &str,
-                  source: &str| {
-        for p in params {
-            let name = p.name().unwrap_or_default();
-            let key = ssm_name_to_env_key(name, strip_prefix);
-            let value = p.value().unwrap_or_default().to_string();
-            merged.insert(key, (value, source.to_string()));
-        }
-    };
-
-    // shared (lowest priority)
-    if !shared_params.is_empty() {
-        ingest(&mut merged, &shared_params, SHARED_PREFIX, "shared");
-    }
-    // include-tag params (各 name の prefix は一律ではないので、parameter name 末尾で key 化)
-    for p in &tag_params {
-        let name = p.name().unwrap_or_default();
-        // 末尾セグメントベース: /amu-revo/<whatever>/a/b/c → A_B_C
-        let rest = name
-            .strip_prefix(&format!("{}/", PREFIX_ROOT))
-            .unwrap_or(name);
-        // 最初の segment (app name) をスキップ
-        let after_app = rest.splitn(2, '/').nth(1).unwrap_or(rest);
-        let key = after_app.replace(['/', '-'], "_").to_uppercase();
-        let value = p.value().unwrap_or_default().to_string();
-        // shared がカバーしたならスキップ (app 優先は後で処理)
-        merged.entry(key).and_modify(|e| *e = (value.clone(), "tag".to_string()))
-            .or_insert_with(|| (value, "tag".to_string()));
-    }
-    // app (highest priority)
-    ingest(&mut merged, &app_params, &prefix, "app");
-
-    // 衝突検出: app が shared/tag を override した key を warning 表示
-    // 厳密には ingest 前後の source を比較する必要があるので再計算
-    let mut conflicts: Vec<String> = Vec::new();
-    let mut app_keys = std::collections::HashSet::new();
-    for p in &app_params {
-        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), &prefix);
-        app_keys.insert(key);
-    }
-    let mut shared_keys = std::collections::HashSet::new();
-    for p in &shared_params {
-        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), SHARED_PREFIX);
-        shared_keys.insert(key);
-    }
-    for k in &app_keys {
-        if shared_keys.contains(k) {
-            conflicts.push(k.clone());
-        }
-    }
-
-    if !conflicts.is_empty() {
-        eprintln!(
-            "{} {} shared key(s) overridden by app: {}",
-            "warning:".yellow().bold(),
-            conflicts.len(),
-            conflicts.join(", ")
+        bail!(
+            "no parameters for sync (prefix={}, shared={}, include-tags={:?})",
+            prefix,
+            want_shared,
+            raw_include_tags
         );
     }
 
-    let mut entries: Vec<(String, String)> = merged.into_iter().map(|(k, (v, _))| (k, v)).collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // 優先度: app > include-tag > shared
+    // 同じ env key を後から上書き → app が最後に入るよう shared → tag → app の順で ingest
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    let mut shared_keys: HashSet<String> = HashSet::new();
+    let mut app_keys: HashSet<String> = HashSet::new();
 
-    let body: String = entries.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
+    for p in &shared_params {
+        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), SHARED_PREFIX);
+        let value = p.value().unwrap_or_default().to_string();
+        shared_keys.insert(key.clone());
+        merged.insert(key, value);
+    }
+    for p in &tag_params {
+        let key = ssm_name_to_env_key_from_root(p.name().unwrap_or_default());
+        let value = p.value().unwrap_or_default().to_string();
+        merged.insert(key, value);
+    }
+    for p in &app_params {
+        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), &prefix);
+        let value = p.value().unwrap_or_default().to_string();
+        app_keys.insert(key.clone());
+        merged.insert(key, value);
+    }
+
+    let conflicts: Vec<&String> = app_keys.intersection(&shared_keys).collect();
+    if !conflicts.is_empty() {
+        let mut names: Vec<&str> = conflicts.iter().map(|s| s.as_str()).collect();
+        names.sort();
+        eprintln!(
+            "{} {} shared key(s) overridden by app: {}",
+            "warning:".yellow().bold(),
+            names.len(),
+            names.join(", ")
+        );
+    }
+
+    let body: String = merged.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
 
     let existing = std::fs::read_to_string(&out).ok();
     if existing.as_deref() == Some(body.as_str()) {
         println!(
             "ssmm: no change ({} variables; app={}, shared={}, tag={})",
-            entries.len(),
+            merged.len(),
             app_params.len(),
             shared_params.len(),
             tag_params.len()
@@ -794,7 +776,7 @@ async fn cmd_sync(
     std::fs::rename(&tmp, &out)?;
     println!(
         "ssmm: wrote {} variables to {} (app={}, shared={}, tag={})",
-        entries.len(),
+        merged.len(),
         out.display(),
         app_params.len(),
         shared_params.len(),
@@ -820,64 +802,61 @@ async fn cmd_migrate(
         new_prefix.bold()
     );
 
-    let mut migrated_names: Vec<String> = Vec::new();
-    for p in &params {
+    let new_app = new_prefix
+        .strip_prefix(&format!("{}/", PREFIX_ROOT))
+        .map(|s| s.split('/').next().unwrap_or(s).to_string());
+
+    let old_prefix_slash = format!("{}/", old_prefix.trim_end_matches('/'));
+    let new_prefix_trim = new_prefix.trim_end_matches('/').to_string();
+
+    let futs = params.iter().map(|p| {
         let old_name = p.name().unwrap_or_default().to_string();
         let suffix = old_name
-            .strip_prefix(&format!("{}/", old_prefix.trim_end_matches('/')))
-            .unwrap_or(&old_name);
-        let new_name = format!("{}/{}", new_prefix.trim_end_matches('/'), suffix);
-        let value = p.value().unwrap_or_default();
+            .strip_prefix(&old_prefix_slash)
+            .unwrap_or(&old_name)
+            .to_string();
+        let new_name = format!("{}/{}", new_prefix_trim, suffix);
+        let value = p.value().unwrap_or_default().to_string();
         let ptype = p.r#type().cloned().unwrap_or(ParameterType::String);
-
-        client
-            .put_parameter()
-            .name(&new_name)
-            .value(value)
-            .r#type(ptype.clone())
-            .overwrite(true)
-            .send()
-            .await
-            .with_context(|| format!("put {}", new_name))?;
-
-        if let Some(new_app) = new_prefix
-            .strip_prefix(&format!("{}/", PREFIX_ROOT))
-            .map(|s| s.split('/').next().unwrap_or(s).to_string())
-        {
-            let tag = Tag::builder()
-                .key("app")
-                .value(&new_app)
-                .build()
-                .map_err(|e| anyhow!("build tag: {}", e))?;
-            let _ = client
-                .add_tags_to_resource()
-                .resource_type(ResourceTypeForTagging::Parameter)
-                .resource_id(&new_name)
-                .tags(tag)
+        let new_app = new_app.clone();
+        async move {
+            client
+                .put_parameter()
+                .name(&new_name)
+                .value(&value)
+                .r#type(ptype)
+                .overwrite(true)
                 .send()
-                .await;
+                .await
+                .with_context(|| format!("put {}", new_name))?;
+            if let Some(app) = new_app {
+                let _ = client
+                    .add_tags_to_resource()
+                    .resource_type(ResourceTypeForTagging::Parameter)
+                    .resource_id(&new_name)
+                    .tags(build_tag("app", &app)?)
+                    .send()
+                    .await;
+            }
+            Ok::<_, anyhow::Error>((old_name, new_name))
         }
-
-        println!("  ✓ {} → {}", old_name, new_name);
-        migrated_names.push(old_name);
+    });
+    let migrated = try_join_all(futs).await?;
+    for (old, new) in &migrated {
+        println!("  ✓ {} → {}", old, new);
     }
 
     if delete_old {
-        println!("deleting {} old parameters...", migrated_names.len());
-        for chunk in migrated_names.chunks(10) {
-            let res = client
-                .delete_parameters()
-                .set_names(Some(chunk.to_vec()))
-                .send()
-                .await?;
-            for n in res.deleted_parameters.unwrap_or_default() {
-                println!("  ✓ deleted {}", n);
-            }
+        let old_names: Vec<String> = migrated.iter().map(|(o, _)| o.clone()).collect();
+        println!("deleting {} old parameters...", old_names.len());
+        let deleted = delete_parameters_batched(client, &old_names).await?;
+        for n in deleted {
+            println!("  ✓ deleted {}", n);
         }
     } else {
         println!(
             "{} old parameters preserved. Re-run with --delete-old to remove.",
-            migrated_names.len()
+            migrated.len()
         );
     }
     Ok(())
@@ -909,10 +888,11 @@ async fn cmd_check(
             by_tail.entry(tail.to_string()).or_default().push(app.to_string());
         }
         println!("{}", "[key-name duplicates]".bold());
-        let mut found = false;
-        for (tail, apps) in &by_tail {
-            if apps.len() >= 2 {
-                found = true;
+        let groups: Vec<_> = by_tail.iter().filter(|(_, apps)| apps.len() >= 2).collect();
+        if groups.is_empty() {
+            println!("  no duplicates.");
+        } else {
+            for (tail, apps) in groups {
                 println!(
                     "  {}: {} [{} apps]",
                     tail.yellow().bold(),
@@ -920,9 +900,6 @@ async fn cmd_check(
                     apps.len()
                 );
             }
-        }
-        if !found {
-            println!("  no duplicates.");
         }
     }
 
@@ -937,25 +914,21 @@ async fn cmd_check(
             let value = p.value().unwrap_or_default().to_string();
             by_value.entry(value).or_default().push(name);
         }
-        let mut found = false;
-        let groups: Vec<_> = by_value
-            .iter()
-            .filter(|(_, names)| names.len() >= 2)
-            .collect();
-        for (value, names) in groups {
-            found = true;
-            let display = if show_values {
-                value.clone()
-            } else {
-                format!("sha256={} len={}", hash8(value), value.len())
-            };
-            println!("  {} [{} parameters]", display.yellow().bold(), names.len());
-            for n in names {
-                println!("    - {}", n);
-            }
-        }
-        if !found {
+        let groups: Vec<_> = by_value.iter().filter(|(_, names)| names.len() >= 2).collect();
+        if groups.is_empty() {
             println!("  no value duplicates.");
+        } else {
+            for (value, names) in groups {
+                let display = if show_values {
+                    value.clone()
+                } else {
+                    format!("sha256={} len={}", hash8(value), value.len())
+                };
+                println!("  {} [{} parameters]", display.yellow().bold(), names.len());
+                for n in names {
+                    println!("    - {}", n);
+                }
+            }
         }
     }
 
@@ -970,21 +943,11 @@ async fn cmd_tag(client: &Client, action: TagAction) -> Result<()> {
             if tag_pairs.iter().any(|(k, _)| k == "app") {
                 bail!("`app` tag is reserved; cannot add via `ssmm tag add`");
             }
-            let tag_objs: Vec<Tag> = tag_pairs
-                .iter()
-                .map(|(k, v)| {
-                    Tag::builder()
-                        .key(k)
-                        .value(v)
-                        .build()
-                        .map_err(|e| anyhow!("build tag {}={}: {}", k, v, e))
-                })
-                .collect::<Result<_>>()?;
             client
                 .add_tags_to_resource()
                 .resource_type(ResourceTypeForTagging::Parameter)
                 .resource_id(&name)
-                .set_tags(Some(tag_objs))
+                .set_tags(Some(build_tags(&tag_pairs)?))
                 .send()
                 .await
                 .with_context(|| format!("add tags to {}", name))?;
