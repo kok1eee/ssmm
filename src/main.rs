@@ -25,7 +25,10 @@ static PREFIX_ROOT: OnceLock<String> = OnceLock::new();
 static SHARED_PREFIX: OnceLock<String> = OnceLock::new();
 
 fn prefix_root() -> &'static str {
-    PREFIX_ROOT.get().map(String::as_str).unwrap_or(DEFAULT_PREFIX_ROOT)
+    PREFIX_ROOT
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_PREFIX_ROOT)
 }
 
 fn shared_prefix() -> &'static str {
@@ -40,7 +43,10 @@ where
     F: IntoIterator<Item = Fut>,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    stream::iter(futs).buffer_unordered(limit).try_collect().await
+    stream::iter(futs)
+        .buffer_unordered(limit)
+        .try_collect()
+        .await
 }
 
 #[derive(Parser)]
@@ -172,6 +178,12 @@ enum TagAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // stdout パイプ先が閉じても panic ではなく静かに終了させる (例: `ssmm list | head`)
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     let root = cli
@@ -188,35 +200,49 @@ async fn main() -> Result<()> {
     let _ = SHARED_PREFIX.set(shared);
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .retry_config(
-            aws_config::retry::RetryConfig::adaptive()
-                .with_max_attempts(10),
-        )
+        .retry_config(aws_config::retry::RetryConfig::adaptive().with_max_attempts(10))
         .load()
         .await;
     let client = Client::new(&config);
 
     match cli.command {
-        Command::List { app, all, keys_only, tags } => {
-            cmd_list(&client, app, all, keys_only, tags).await
-        }
-        Command::Put { pairs, env, app, plain, tags } => {
-            cmd_put(&client, pairs, env, app, plain, tags).await
-        }
-        Command::Delete { target, app, yes, recursive } => {
-            cmd_delete(&client, target, app, yes, recursive).await
-        }
+        Command::List {
+            app,
+            all,
+            keys_only,
+            tags,
+        } => cmd_list(&client, app, all, keys_only, tags).await,
+        Command::Put {
+            pairs,
+            env,
+            app,
+            plain,
+            tags,
+        } => cmd_put(&client, pairs, env, app, plain, tags).await,
+        Command::Delete {
+            target,
+            app,
+            yes,
+            recursive,
+        } => cmd_delete(&client, target, app, yes, recursive).await,
         Command::Show { key, app } => cmd_show(&client, key, app).await,
         Command::Dirs => cmd_dirs(&client).await,
-        Command::Sync { app, out, no_shared, include_tags } => {
-            cmd_sync(&client, app, out, no_shared, include_tags).await
-        }
-        Command::Migrate { old_prefix, new_prefix, delete_old } => {
-            cmd_migrate(&client, old_prefix, new_prefix, delete_old).await
-        }
-        Command::Check { duplicates, values, show_values } => {
-            cmd_check(&client, duplicates, values, show_values).await
-        }
+        Command::Sync {
+            app,
+            out,
+            no_shared,
+            include_tags,
+        } => cmd_sync(&client, app, out, no_shared, include_tags).await,
+        Command::Migrate {
+            old_prefix,
+            new_prefix,
+            delete_old,
+        } => cmd_migrate(&client, old_prefix, new_prefix, delete_old).await,
+        Command::Check {
+            duplicates,
+            values,
+            show_values,
+        } => cmd_check(&client, duplicates, values, show_values).await,
         Command::Tag { action } => cmd_tag(&client, action).await,
     }
 }
@@ -248,7 +274,11 @@ fn resolve_param_name(key: &str, app: Option<String>) -> Result<String> {
     if key.starts_with('/') {
         return Ok(key.to_string());
     }
-    Ok(format!("{}/{}", app_prefix(&resolve_app(app)?), env_key_to_ssm_tail(key)))
+    Ok(format!(
+        "{}/{}",
+        app_prefix(&resolve_app(app)?),
+        env_key_to_ssm_tail(key)
+    ))
 }
 
 fn ssm_name_to_env_key(name: &str, prefix: &str) -> String {
@@ -259,8 +289,10 @@ fn ssm_name_to_env_key(name: &str, prefix: &str) -> String {
 
 /// /amu-revo/<app>/<tail...> → <TAIL_UPCASE_UNDERSCORED>   (app セグメントを落とす)
 fn ssm_name_to_env_key_from_root(name: &str) -> String {
-    let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
-    let after_app = rest.splitn(2, '/').nth(1).unwrap_or("");
+    let rest = name
+        .strip_prefix(&format!("{}/", prefix_root()))
+        .unwrap_or(name);
+    let after_app = rest.split_once('/').map(|(_, tail)| tail).unwrap_or("");
     after_app.replace(['/', '-'], "_").to_uppercase()
 }
 
@@ -274,7 +306,15 @@ fn should_be_secure(key: &str) -> bool {
         return true;
     }
     const NON_SECRET_SUFFIXES: &[&str] = &[
-        "_path", "_url", "_channel", "_name", "_host", "_port", "_region", "_endpoint", "_dir",
+        "_path",
+        "_url",
+        "_channel",
+        "_name",
+        "_host",
+        "_port",
+        "_region",
+        "_endpoint",
+        "_dir",
     ];
     if NON_SECRET_SUFFIXES.iter().any(|s| lc.ends_with(s)) {
         return false;
@@ -295,8 +335,8 @@ fn build_tags(pairs: &[(String, String)]) -> Result<Vec<Tag>> {
 }
 
 fn read_env_file(path: &Path) -> Result<Vec<(String, String)>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut out = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -305,8 +345,14 @@ fn read_env_file(path: &Path) -> Result<Vec<(String, String)>> {
         }
         if let Some((k, v)) = line.split_once('=') {
             let v = v.trim();
-            let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
-            let v = v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(v);
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(v);
+            let v = v
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .unwrap_or(v);
             out.push((k.trim().to_string(), v.to_string()));
         }
     }
@@ -352,7 +398,10 @@ async fn get_parameters_by_path(client: &Client, prefix: &str) -> Result<Vec<Par
         if let Some(t) = &next {
             req = req.next_token(t);
         }
-        let res = req.send().await.with_context(|| format!("get params {}", prefix))?;
+        let res = req
+            .send()
+            .await
+            .with_context(|| format!("get params {}", prefix))?;
         if let Some(ps) = res.parameters {
             all.extend(ps);
         }
@@ -396,11 +445,16 @@ async fn names_filtered_by_tags(
     let mut names = Vec::new();
     let mut next: Option<String> = None;
     loop {
-        let mut req = client.describe_parameters().set_parameter_filters(Some(filters.clone()));
+        let mut req = client
+            .describe_parameters()
+            .set_parameter_filters(Some(filters.clone()));
         if let Some(t) = &next {
             req = req.next_token(t);
         }
-        let res = req.send().await.context("describe_parameters with filters")?;
+        let res = req
+            .send()
+            .await
+            .context("describe_parameters with filters")?;
         if let Some(ps) = res.parameters {
             names.extend(ps.into_iter().filter_map(|p| p.name));
         }
@@ -511,12 +565,17 @@ async fn cmd_list(
         let mut by_app: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
-            let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
+            let rest = name
+                .strip_prefix(&format!("{}/", prefix_root()))
+                .unwrap_or(name);
             let (app_name, _) = rest.split_once('/').unwrap_or((rest, ""));
             let key = ssm_name_to_env_key_from_root(name);
             let value = p.value().unwrap_or_default().to_string();
             let secure = matches!(p.r#type(), Some(&ParameterType::SecureString));
-            by_app.entry(app_name.to_string()).or_default().push((key, value, secure));
+            by_app
+                .entry(app_name.to_string())
+                .or_default()
+                .push((key, value, secure));
         }
         for (app_name, mut entries) in by_app {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -536,7 +595,10 @@ async fn cmd_list(
             })
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("{}", format!("# {} ({} variables)", prefix, entries.len()).dimmed());
+        println!(
+            "{}",
+            format!("# {} ({} variables)", prefix, entries.len()).dimmed()
+        );
         for (k, v, secure) in entries {
             print_entry(&k, Some(&v), secure, keys_only, "");
         }
@@ -566,14 +628,21 @@ async fn cmd_put(
     let before = kvs.len();
     kvs.retain(|(k, v)| {
         if v.is_empty() {
-            eprintln!("  {} empty value, skipped: {}", "warning:".yellow().bold(), k);
+            eprintln!(
+                "  {} empty value, skipped: {}",
+                "warning:".yellow().bold(),
+                k
+            );
             false
         } else {
             true
         }
     });
     if kvs.len() < before {
-        eprintln!("  ({} key(s) skipped due to empty value)", before - kvs.len());
+        eprintln!(
+            "  ({} key(s) skipped due to empty value)",
+            before - kvs.len()
+        );
     }
     if kvs.is_empty() {
         bail!("no key=value to put");
@@ -585,8 +654,10 @@ async fn cmd_put(
     }
 
     let app_tag_pair = vec![("app".to_string(), app.clone())];
-    let all_tags: Vec<(String, String)> =
-        app_tag_pair.into_iter().chain(extra_tags.iter().cloned()).collect();
+    let all_tags: Vec<(String, String)> = app_tag_pair
+        .into_iter()
+        .chain(extra_tags.iter().cloned())
+        .collect();
 
     let futs = kvs.iter().map(|(k, v)| {
         let name = format!("{}/{}", prefix, env_key_to_ssm_tail(k));
@@ -655,7 +726,11 @@ async fn cmd_delete(
     let absolute = if target.starts_with('/') {
         target.clone()
     } else {
-        format!("{}/{}", app_prefix(&resolve_app(app)?), env_key_to_ssm_tail(&target))
+        format!(
+            "{}/{}",
+            app_prefix(&resolve_app(app)?),
+            env_key_to_ssm_tail(&target)
+        )
     };
 
     if recursive {
@@ -664,7 +739,11 @@ async fn cmd_delete(
             println!("(no parameters under {})", absolute);
             return Ok(());
         }
-        println!("about to delete {} parameters under {}:", params.len(), absolute.bold());
+        println!(
+            "about to delete {} parameters under {}:",
+            params.len(),
+            absolute.bold()
+        );
         for p in &params {
             println!("  - {}", p.name().unwrap_or_default());
         }
@@ -709,7 +788,11 @@ async fn cmd_show(client: &Client, key: String, app: Option<String>) -> Result<(
     if let Some(p) = res.parameter {
         let value = p.value().unwrap_or_default();
         let secure = matches!(p.r#type(), Some(&ParameterType::SecureString));
-        let label = if secure { "SecureString".yellow() } else { "String".green() };
+        let label = if secure {
+            "SecureString".yellow()
+        } else {
+            "String".green()
+        };
         println!("# {} ({})", name.dimmed(), label);
         println!("{}", value);
     }
@@ -721,7 +804,9 @@ async fn cmd_dirs(client: &Client) -> Result<()> {
     let mut by_app: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for p in &params {
         let name = p.name().unwrap_or_default();
-        let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
+        let rest = name
+            .strip_prefix(&format!("{}/", prefix_root()))
+            .unwrap_or(name);
         let app = rest.split('/').next().unwrap_or(rest).to_string();
         let entry = by_app.entry(app).or_insert((0, 0));
         entry.0 += 1;
@@ -733,7 +818,12 @@ async fn cmd_dirs(client: &Client) -> Result<()> {
         println!("(no parameters under {})", prefix_root());
         return Ok(());
     }
-    println!("{:<32} {:>6} {:>8}", "app".bold(), "total".bold(), "secure".bold());
+    println!(
+        "{:<32} {:>6} {:>8}",
+        "app".bold(),
+        "total".bold(),
+        "secure".bold()
+    );
     for (app, (total, secure)) in by_app {
         println!("{:<32} {:>6} {:>8}", app, total, secure);
     }
@@ -777,8 +867,10 @@ async fn cmd_sync(
         .chain(shared_params.iter())
         .filter_map(|p| p.name())
         .collect();
-    let tag_param_names: Vec<String> =
-        tag_names.into_iter().filter(|n| !already.contains(n.as_str())).collect();
+    let tag_param_names: Vec<String> = tag_names
+        .into_iter()
+        .filter(|n| !already.contains(n.as_str()))
+        .collect();
     let tag_params = get_parameters_by_names(client, &tag_param_names).await?;
 
     if app_params.is_empty() && shared_params.is_empty() && tag_params.is_empty() {
@@ -826,7 +918,10 @@ async fn cmd_sync(
         );
     }
 
-    let body: String = merged.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
+    let body: String = merged
+        .iter()
+        .map(|(k, v)| format!("{}={}\n", k, v))
+        .collect();
 
     let existing = std::fs::read_to_string(&out).ok();
     if existing.as_deref() == Some(body.as_str()) {
@@ -953,9 +1048,14 @@ async fn cmd_check(
         let mut by_tail: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
-            let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
+            let rest = name
+                .strip_prefix(&format!("{}/", prefix_root()))
+                .unwrap_or(name);
             let (app, tail) = rest.split_once('/').unwrap_or((rest, ""));
-            by_tail.entry(tail.to_string()).or_default().push(app.to_string());
+            by_tail
+                .entry(tail.to_string())
+                .or_default()
+                .push(app.to_string());
         }
         println!("{}", "[key-name duplicates]".bold());
         let groups: Vec<_> = by_tail.iter().filter(|(_, apps)| apps.len() >= 2).collect();
@@ -984,7 +1084,10 @@ async fn cmd_check(
             let value = p.value().unwrap_or_default().to_string();
             by_value.entry(value).or_default().push(name);
         }
-        let groups: Vec<_> = by_value.iter().filter(|(_, names)| names.len() >= 2).collect();
+        let groups: Vec<_> = by_value
+            .iter()
+            .filter(|(_, names)| names.len() >= 2)
+            .collect();
         if groups.is_empty() {
             println!("  no value duplicates.");
         } else {
@@ -1067,4 +1170,156 @@ async fn cmd_tag(client: &Client, action: TagAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as IoWrite;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn ssm_name_to_env_key_basic() {
+        assert_eq!(
+            ssm_name_to_env_key(
+                "/amu-revo/hikken-schedule/kintone-id",
+                "/amu-revo/hikken-schedule"
+            ),
+            "KINTONE_ID"
+        );
+    }
+
+    #[test]
+    fn ssm_name_to_env_key_nested_segments() {
+        assert_eq!(
+            ssm_name_to_env_key("/amu-revo/postdata/x/kyushu/api-key", "/amu-revo/postdata"),
+            "X_KYUSHU_API_KEY"
+        );
+    }
+
+    #[test]
+    fn ssm_name_to_env_key_from_root_strips_app() {
+        assert_eq!(
+            ssm_name_to_env_key_from_root("/amu-revo/app-name/kintone-id"),
+            "KINTONE_ID"
+        );
+        assert_eq!(
+            ssm_name_to_env_key_from_root("/amu-revo/postdata/x/kyushu/api-key"),
+            "X_KYUSHU_API_KEY"
+        );
+    }
+
+    #[test]
+    fn env_key_to_ssm_tail_lowercases_and_dasheses() {
+        assert_eq!(
+            env_key_to_ssm_tail("KINTONE_API_TOKEN"),
+            "kintone-api-token"
+        );
+        assert_eq!(env_key_to_ssm_tail("PTOWN_PASS"), "ptown-pass");
+        assert_eq!(env_key_to_ssm_tail("A"), "a");
+    }
+
+    #[test]
+    fn should_be_secure_default_true() {
+        assert!(should_be_secure("KINTONE_API_TOKEN"));
+        assert!(should_be_secure("SLACK_BOT_TOKEN"));
+        assert!(should_be_secure("SOMETHING_UNKNOWN"));
+        assert!(should_be_secure("PTOWN_USERNAME"));
+    }
+
+    #[test]
+    fn should_be_secure_webhook_overrides_url_suffix() {
+        // webhook は _url suffix より優先 (secret 扱い)
+        assert!(should_be_secure("SLACK_WEBHOOK_URL"));
+    }
+
+    #[test]
+    fn should_be_secure_public_suffixes_map_to_string() {
+        assert!(!should_be_secure("GOOGLE_CREDENTIALS_PATH"));
+        assert!(!should_be_secure("GOOGLE_SPREADSHEET_URL"));
+        assert!(!should_be_secure("SLACK_CHANNEL"));
+        assert!(!should_be_secure("DB_HOST"));
+        assert!(!should_be_secure("HTTP_PORT"));
+        assert!(!should_be_secure("AWS_REGION"));
+    }
+
+    #[test]
+    fn parse_tags_basic() {
+        let tags = parse_tags(&["env=prod".to_string(), "owner=backend".to_string()]).unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                ("env".to_string(), "prod".to_string()),
+                ("owner".to_string(), "backend".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tags_trims_whitespace() {
+        let tags = parse_tags(&["  env = prod  ".to_string()]).unwrap();
+        assert_eq!(tags, vec![("env".to_string(), "prod".to_string())]);
+    }
+
+    #[test]
+    fn parse_tags_rejects_missing_equals() {
+        let err = parse_tags(&["no-equals".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("invalid tag"));
+    }
+
+    #[test]
+    fn parse_kv_pairs_basic() {
+        let pairs = parse_kv_pairs(&["A=1".to_string(), "B=2".to_string()]).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_kv_pairs_value_with_equals_sign() {
+        // split_once: 最初の '=' までで分割。値内の '=' は保持
+        let pairs = parse_kv_pairs(&["URL=https://a.com?x=y".to_string()]).unwrap();
+        assert_eq!(
+            pairs,
+            vec![("URL".to_string(), "https://a.com?x=y".to_string())]
+        );
+    }
+
+    #[test]
+    fn hash8_is_deterministic_and_length_8() {
+        assert_eq!(hash8("hello"), hash8("hello"));
+        assert_ne!(hash8("hello"), hash8("world"));
+        assert_eq!(hash8("hello").len(), 8);
+    }
+
+    #[test]
+    fn read_env_file_handles_comments_blanks_quotes() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "# this is a comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "KEY1=value1").unwrap();
+        writeln!(f, "KEY2=\"quoted\"").unwrap();
+        writeln!(f, "KEY3='single'").unwrap();
+        writeln!(f, "  KEY4 = trimmed  ").unwrap();
+        let result = read_env_file(f.path()).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                ("KEY1".to_string(), "value1".to_string()),
+                ("KEY2".to_string(), "quoted".to_string()),
+                ("KEY3".to_string(), "single".to_string()),
+                ("KEY4".to_string(), "trimmed".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_prefix_uses_default_prefix_root() {
+        // OnceLock が未 set なら DEFAULT_PREFIX_ROOT が使われる
+        assert_eq!(app_prefix("foo"), format!("{}/foo", DEFAULT_PREFIX_ROOT));
+    }
 }
