@@ -5,36 +5,56 @@ use aws_sdk_ssm::types::{
 };
 use clap::{ArgAction, Parser, Subcommand};
 use colored::Colorize;
-use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// AWS SSM の標準パラメータは PutParameter が低 TPS で throttle される。
-/// 並列上限をかけて安全側に倒す（get 系は 10 でも平気だが、write 系は 3 推奨）
+const DEFAULT_PREFIX_ROOT: &str = "/amu-revo";
+const SSMM_ENV_VAR: &str = "SSMM_PREFIX_ROOT";
+
+/// SSM PutParameter の TPS (~3) に合わせて書き込み並列度を制限。
+/// read 系 (GetParameters 等) は余裕があるので大きめ。
 const WRITE_CONCURRENCY: usize = 3;
 const READ_CONCURRENCY: usize = 10;
+
+static PREFIX_ROOT: OnceLock<String> = OnceLock::new();
+static SHARED_PREFIX: OnceLock<String> = OnceLock::new();
+
+fn prefix_root() -> &'static str {
+    PREFIX_ROOT.get().map(String::as_str).unwrap_or(DEFAULT_PREFIX_ROOT)
+}
+
+fn shared_prefix() -> &'static str {
+    SHARED_PREFIX
+        .get()
+        .map(String::as_str)
+        .unwrap_or("/amu-revo/shared")
+}
 
 async fn run_bounded<F, Fut, T>(futs: F, limit: usize) -> Result<Vec<T>>
 where
     F: IntoIterator<Item = Fut>,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    stream::iter(futs)
-        .buffer_unordered(limit)
-        .try_collect()
-        .await
+    stream::iter(futs).buffer_unordered(limit).try_collect().await
 }
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-
-const PREFIX_ROOT: &str = "/amu-revo";
-const SHARED_PREFIX: &str = "/amu-revo/shared";
 
 #[derive(Parser)]
-#[command(name = "ssmm", version, about = "SSM Parameter Store helper for amu-revo team")]
+#[command(
+    name = "ssmm",
+    version,
+    about = "AWS SSM Parameter Store helper for team-scoped .env sync"
+)]
 struct Cli {
+    /// Root prefix all parameters live under
+    /// (default: /amu-revo; override via $SSMM_PREFIX_ROOT env var)
+    #[arg(long, global = true)]
+    prefix: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -153,6 +173,20 @@ enum TagAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    let root = cli
+        .prefix
+        .clone()
+        .or_else(|| std::env::var(SSMM_ENV_VAR).ok())
+        .unwrap_or_else(|| DEFAULT_PREFIX_ROOT.to_string());
+    let root = root.trim_end_matches('/').to_string();
+    if !root.starts_with('/') {
+        bail!("prefix must start with '/': got {:?}", root);
+    }
+    let shared = format!("{}/shared", root);
+    let _ = PREFIX_ROOT.set(root);
+    let _ = SHARED_PREFIX.set(shared);
+
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .retry_config(
             aws_config::retry::RetryConfig::adaptive()
@@ -207,7 +241,7 @@ fn resolve_app(app: Option<String>) -> Result<String> {
 }
 
 fn app_prefix(app: &str) -> String {
-    format!("{}/{}", PREFIX_ROOT, app)
+    format!("{}/{}", prefix_root(), app)
 }
 
 fn resolve_param_name(key: &str, app: Option<String>) -> Result<String> {
@@ -225,7 +259,7 @@ fn ssm_name_to_env_key(name: &str, prefix: &str) -> String {
 
 /// /amu-revo/<app>/<tail...> → <TAIL_UPCASE_UNDERSCORED>   (app セグメントを落とす)
 fn ssm_name_to_env_key_from_root(name: &str) -> String {
-    let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
+    let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
     let after_app = rest.splitn(2, '/').nth(1).unwrap_or("");
     after_app.replace(['/', '-'], "_").to_uppercase()
 }
@@ -450,7 +484,7 @@ async fn cmd_list(
     raw_tags: Vec<String>,
 ) -> Result<()> {
     let prefix = if all {
-        PREFIX_ROOT.to_string()
+        prefix_root().to_string()
     } else {
         app_prefix(&resolve_app(app)?)
     };
@@ -477,7 +511,7 @@ async fn cmd_list(
         let mut by_app: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
-            let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
+            let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
             let (app_name, _) = rest.split_once('/').unwrap_or((rest, ""));
             let key = ssm_name_to_env_key_from_root(name);
             let value = p.value().unwrap_or_default().to_string();
@@ -683,11 +717,11 @@ async fn cmd_show(client: &Client, key: String, app: Option<String>) -> Result<(
 }
 
 async fn cmd_dirs(client: &Client) -> Result<()> {
-    let params = get_parameters_by_path(client, PREFIX_ROOT).await?;
+    let params = get_parameters_by_path(client, prefix_root()).await?;
     let mut by_app: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for p in &params {
         let name = p.name().unwrap_or_default();
-        let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
+        let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
         let app = rest.split('/').next().unwrap_or(rest).to_string();
         let entry = by_app.entry(app).or_insert((0, 0));
         entry.0 += 1;
@@ -696,7 +730,7 @@ async fn cmd_dirs(client: &Client) -> Result<()> {
         }
     }
     if by_app.is_empty() {
-        println!("(no parameters under {})", PREFIX_ROOT);
+        println!("(no parameters under {})", prefix_root());
         return Ok(());
     }
     println!("{:<32} {:>6} {:>8}", "app".bold(), "total".bold(), "secure".bold());
@@ -723,7 +757,7 @@ async fn cmd_sync(
         get_parameters_by_path(client, &prefix),
         async {
             if want_shared {
-                get_parameters_by_path(client, SHARED_PREFIX).await
+                get_parameters_by_path(client, shared_prefix()).await
             } else {
                 Ok(Vec::new())
             }
@@ -732,7 +766,7 @@ async fn cmd_sync(
             if include_tags.is_empty() {
                 Ok(Vec::new())
             } else {
-                names_filtered_by_tags(client, &include_tags, Some(PREFIX_ROOT)).await
+                names_filtered_by_tags(client, &include_tags, Some(prefix_root())).await
             }
         }
     )?;
@@ -763,7 +797,7 @@ async fn cmd_sync(
     let mut app_keys: HashSet<String> = HashSet::new();
 
     for p in &shared_params {
-        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), SHARED_PREFIX);
+        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), shared_prefix());
         let value = p.value().unwrap_or_default().to_string();
         shared_keys.insert(key.clone());
         merged.insert(key, value);
@@ -839,7 +873,7 @@ async fn cmd_migrate(
     );
 
     let new_app = new_prefix
-        .strip_prefix(&format!("{}/", PREFIX_ROOT))
+        .strip_prefix(&format!("{}/", prefix_root()))
         .map(|s| s.split('/').next().unwrap_or(s).to_string());
 
     let old_prefix_slash = format!("{}/", old_prefix.trim_end_matches('/'));
@@ -909,9 +943,9 @@ async fn cmd_check(
         return Ok(());
     }
 
-    let params = get_parameters_by_path(client, PREFIX_ROOT).await?;
+    let params = get_parameters_by_path(client, prefix_root()).await?;
     if params.is_empty() {
-        println!("(no parameters under {})", PREFIX_ROOT);
+        println!("(no parameters under {})", prefix_root());
         return Ok(());
     }
 
@@ -919,7 +953,7 @@ async fn cmd_check(
         let mut by_tail: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
-            let rest = name.strip_prefix(&format!("{}/", PREFIX_ROOT)).unwrap_or(name);
+            let rest = name.strip_prefix(&format!("{}/", prefix_root())).unwrap_or(name);
             let (app, tail) = rest.split_once('/').unwrap_or((rest, ""));
             by_tail.entry(tail.to_string()).or_default().push(app.to_string());
         }
