@@ -15,7 +15,7 @@ anyhow = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-ssm = "1"
 clap = { version = "4", features = ["derive"] }
-colored = "2"
+colored = "3"
 futures = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
