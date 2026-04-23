@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const DEFAULT_PREFIX_ROOT: &str = "/amu-revo";
+const DEFAULT_SHARED_PREFIX: &str = "/amu-revo/shared";
 const SSMM_ENV_VAR: &str = "SSMM_PREFIX_ROOT";
 
 /// SSM PutParameter の TPS (~3) に合わせて書き込み並列度を制限。
@@ -35,7 +36,7 @@ fn shared_prefix() -> &'static str {
     SHARED_PREFIX
         .get()
         .map(String::as_str)
-        .unwrap_or("/amu-revo/shared")
+        .unwrap_or(DEFAULT_SHARED_PREFIX)
 }
 
 async fn run_bounded<F, Fut, T>(futs: F, limit: usize) -> Result<Vec<T>>
@@ -196,8 +197,12 @@ async fn main() -> Result<()> {
         bail!("prefix must start with '/': got {:?}", root);
     }
     let shared = format!("{}/shared", root);
-    let _ = PREFIX_ROOT.set(root);
-    let _ = SHARED_PREFIX.set(shared);
+    PREFIX_ROOT
+        .set(root)
+        .expect("PREFIX_ROOT should only be set once during startup");
+    SHARED_PREFIX
+        .set(shared)
+        .expect("SHARED_PREFIX should only be set once during startup");
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .retry_config(aws_config::retry::RetryConfig::adaptive().with_max_attempts(10))
@@ -562,12 +567,11 @@ async fn cmd_list(
     }
 
     if all {
+        let prefix_slash = format!("{}/", prefix_root());
         let mut by_app: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
-            let rest = name
-                .strip_prefix(&format!("{}/", prefix_root()))
-                .unwrap_or(name);
+            let rest = name.strip_prefix(&prefix_slash).unwrap_or(name);
             let (app_name, _) = rest.split_once('/').unwrap_or((rest, ""));
             let key = ssm_name_to_env_key_from_root(name);
             let value = p.value().unwrap_or_default().to_string();
@@ -681,13 +685,21 @@ async fn cmd_put(
                 .await
                 .with_context(|| format!("put-parameter {}", name))?;
 
-            let _ = client
+            if let Err(e) = client
                 .add_tags_to_resource()
                 .resource_type(ResourceTypeForTagging::Parameter)
                 .resource_id(&name)
                 .set_tags(Some(tag_objs))
                 .send()
-                .await;
+                .await
+            {
+                eprintln!(
+                    "  {} tag failed for {}: {}",
+                    "warning:".yellow().bold(),
+                    name,
+                    e
+                );
+            }
 
             Ok::<_, anyhow::Error>((name, ptype, key, value.len()))
         }
@@ -801,12 +813,11 @@ async fn cmd_show(client: &Client, key: String, app: Option<String>) -> Result<(
 
 async fn cmd_dirs(client: &Client) -> Result<()> {
     let params = get_parameters_by_path(client, prefix_root()).await?;
+    let prefix_slash = format!("{}/", prefix_root());
     let mut by_app: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for p in &params {
         let name = p.name().unwrap_or_default();
-        let rest = name
-            .strip_prefix(&format!("{}/", prefix_root()))
-            .unwrap_or(name);
+        let rest = name.strip_prefix(&prefix_slash).unwrap_or(name);
         let app = rest.split('/').next().unwrap_or(rest).to_string();
         let entry = by_app.entry(app).or_insert((0, 0));
         entry.0 += 1;
@@ -994,14 +1005,21 @@ async fn cmd_migrate(
                 .send()
                 .await
                 .with_context(|| format!("put {}", new_name))?;
-            if let Some(app) = new_app {
-                let _ = client
+            if let Some(app) = new_app
+                && let Err(e) = client
                     .add_tags_to_resource()
                     .resource_type(ResourceTypeForTagging::Parameter)
                     .resource_id(&new_name)
                     .tags(build_tag("app", &app)?)
                     .send()
-                    .await;
+                    .await
+            {
+                eprintln!(
+                    "  {} tag failed for {}: {}",
+                    "warning:".yellow().bold(),
+                    new_name,
+                    e
+                );
             }
             Ok::<_, anyhow::Error>((old_name, new_name))
         }
@@ -1045,12 +1063,11 @@ async fn cmd_check(
     }
 
     if duplicates {
+        let prefix_slash = format!("{}/", prefix_root());
         let mut by_tail: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in &params {
             let name = p.name().unwrap_or_default();
-            let rest = name
-                .strip_prefix(&format!("{}/", prefix_root()))
-                .unwrap_or(name);
+            let rest = name.strip_prefix(&prefix_slash).unwrap_or(name);
             let (app, tail) = rest.split_once('/').unwrap_or((rest, ""));
             by_tail
                 .entry(tail.to_string())
