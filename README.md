@@ -268,6 +268,30 @@ When `--app` is omitted, `ssmm` picks the name from the current directory:
 
 Override with `--app <name>` any time.
 
+## Path values and portability
+
+SSM stores parameter values as opaque bytes; `ssmm` does not expand
+shell-style shortcuts like `~` on the way in or out. When a value is a
+filesystem path, prefer the `$HOME`-relative form and let the consuming
+app expand it at runtime:
+
+```
+# SSM parameter (portable)
+GOOGLE_SERVICE_ACCOUNT_KEY_PATH=~/.credentials/service-account.json
+```
+
+```python
+# Python — app side
+import os
+path = os.path.expanduser(os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_PATH") or "")
+```
+
+Why this matters: a hard-coded absolute path (e.g. `/home/ec2-user/...`)
+in SSM works on that one host but silently breaks local dev on a
+different `$HOME`. With `~` + `expanduser`, one SSM value serves every
+environment. The same applies to path-like env vars in general — store
+them portable, expand on read.
+
 ## Concurrency and throttling
 
 SSM's `PutParameter` has a low per-account TPS (~3/s for standard
