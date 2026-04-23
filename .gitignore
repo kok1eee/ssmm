@@ -1,0 +1,5 @@
+/target
+
+# Claude Code local runtime state (not meant for VCS)
+.claude/hooks-error.log
+.claude/scheduled_tasks.lock

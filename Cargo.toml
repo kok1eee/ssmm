@@ -1,0 +1,32 @@
+[package]
+name = "ssmm"
+version = "0.3.1"
+edition = "2024"
+description = "AWS SSM Parameter Store helper for team-scoped .env sync (systemd friendly)"
+license = "MIT"
+repository = "https://github.com/kok1eee/ssmm"
+homepage = "https://github.com/kok1eee/ssmm"
+readme = "README.md"
+keywords = ["aws", "ssm", "parameter-store", "dotenv", "systemd"]
+categories = ["command-line-utilities", "config"]
+
+[dependencies]
+anyhow = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ssm = "1"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+futures = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
