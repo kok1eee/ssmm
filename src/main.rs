@@ -131,5 +131,40 @@ async fn main() -> Result<()> {
             show_values,
         } => commands::check::cmd_check(&client, duplicates, values, show_values).await,
         Command::Tag { action } => commands::tag::cmd_tag(&client, action).await,
+        Command::Onboard {
+            unit,
+            app,
+            env,
+            exec_cmd,
+            plain_all,
+            plain_keys,
+            secure_keys,
+            tags,
+            system,
+            keep_env_files,
+            pre_execs,
+            ssmm_bin,
+            overwrite,
+            apply,
+        } => {
+            commands::onboard::cmd_onboard(
+                &client,
+                unit,
+                app,
+                env,
+                exec_cmd,
+                plain_all,
+                plain_keys,
+                secure_keys,
+                tags,
+                system,
+                keep_env_files,
+                pre_execs,
+                ssmm_bin,
+                overwrite,
+                apply,
+            )
+            .await
+        }
     }
 }

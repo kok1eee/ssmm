@@ -1,6 +1,6 @@
 ---
 name: ssmm
-description: AWS SSM Parameter Store を source of truth にして平文 .env を脱却する OSS ワークフロー。`sync` モード (systemd の EnvironmentFile= 用に mode 0600 の .env を再生成) と `exec` モード (プロセス環境変数に直注入、ディスクに .env を残さない、chamber 互換) の 2 方式を提供。`migrate-to-exec` で既存 sync unit を drop-in 生成で一括 exec 化可能。team-scoped prefix (/<team>/<app>/<key>) で横断管理、SecureString / String 自動判定、shared / tag overlay、prefix 移行に使う。Rust CLI `ssmm` (crates.io) が必要。
+description: AWS SSM Parameter Store を source of truth にして平文 .env を脱却する OSS ワークフロー。`sync` モード (systemd の EnvironmentFile= 用に mode 0600 の .env を再生成) と `exec` モード (プロセス環境変数に直注入、ディスクに .env を残さない、chamber 互換) の 2 方式を提供。`migrate-to-exec` で既存 sync unit を drop-in 生成で一括 exec 化可能。`onboard` で .env → SSM put + drop-in 生成 + daemon-reload を 1 コマンドで完結 (greenfield アプリ用、default-fail 衝突ガード付き)。team-scoped prefix (/<team>/<app>/<key>) で横断管理、SecureString / String 自動判定、shared / tag overlay、prefix 移行に使う。Rust CLI `ssmm` (crates.io) が必要。
 ---
 
 Base directory for this skill: <cloned repo>/.claude/skills/ssmm
@@ -191,6 +191,38 @@ ssmm migrate-to-exec ... --apply
   `sdtab upgrade` が走ったとき `exec-mode.conf` が温存されるかは
   バージョン依存なので、初回移行後 1 度 `sdtab upgrade` を走らせて
   survives するか軽く確認しておくと安心。
+
+#### 3D. グリーンフィールド: `.env` → SSM + drop-in を 1 コマンド (`ssmm onboard`, v0.6.0+)
+
+SSM にまだ投入していない新規アプリを `.env` 1 つから一発セットアップ:
+
+```bash
+# dry-run: put plan + drop-in プレビュー (SSM 衝突も列挙)
+ssmm onboard \
+  --unit <unit>.service \
+  --app <ssm-app> \
+  --env /path/to/<app>.env \
+  --exec-cmd "<目的の ExecStart= 相当>" \
+  --keep-env-file /<team 共通 env> \
+  --pre-exec "<prep コマンド>"
+
+# 確定: put + drop-in 書き込み + daemon-reload
+ssmm onboard ... --apply
+```
+
+- **デフォルトは既存 key が 1 つでもあれば fail**。`ssmm put --secure` で
+  ローテーションした値を silently 上書きする事故を防ぐガード。衝突した
+  key 名は全列挙され、`--overwrite` か `ssmm delete <app> -r` を促す。
+- `--overwrite` 時でも dry-run には `# WILL OVERWRITE N existing SSM key(s)`
+  ヘッダーと該当 key 一覧が出るので、破壊的意図を見落とさない。
+- 空値 (`EMPTY=`) は `put` と同じく事前にフィルタ。put には行かず、
+  collision 判定からも除外される。
+- 値は dry-run に一切出ない (`len=N` のみ)。snapshot test で pin 済み。
+- **途中で失敗したら**: SSM put 成功後に daemon-reload が失敗した場合、
+  エラーメッセージが `ssmm delete <app> -r` による revert 手順を示す。
+  書いた drop-in は `rm <path>` で消せる (同じエラー内に path が出る)。
+- **SSM に既にある app には使わない**: default-fail ガードで弾かれる。
+  モード切替だけなら `migrate-to-exec` を使う。
 
 ### 4. 動作確認
 

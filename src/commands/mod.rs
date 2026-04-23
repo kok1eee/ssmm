@@ -5,6 +5,7 @@ pub mod exec;
 pub mod list;
 pub mod migrate;
 pub mod migrate_to_exec;
+pub mod onboard;
 pub mod put;
 pub mod show;
 pub mod sync;

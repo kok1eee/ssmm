@@ -168,6 +168,44 @@ ssmm migrate-to-exec ... --apply
   If you later run `sdtab upgrade`, verify `exec-mode.conf` survives —
   report back if it doesn't.
 
+## Onboarding a greenfield app in one command
+
+`ssmm onboard` combines `put --env <file>` and `migrate-to-exec` for apps
+that are not yet in SSM. It reads the `.env`, puts each key, generates
+the systemd drop-in, and runs `daemon-reload` — all from one invocation.
+
+```bash
+# dry-run (default): prints put plan + drop-in preview, reads no files
+ssmm onboard \
+  --unit myapp.service \
+  --app myapp \
+  --env ./myapp.env \
+  --exec-cmd "/usr/bin/uv run python app.py --mode prod" \
+  --keep-env-file /etc/defaults/common \
+  --pre-exec "/usr/bin/playwright install chromium"
+
+# actually put + write drop-in + daemon-reload
+ssmm onboard ... --apply
+```
+
+- **Default is fail-if-any-key-exists.** Running `onboard` twice won't
+  silently overwrite a secret you rotated between runs. Pass
+  `--overwrite` to opt into replace-existing semantics. Dry-run with
+  `--overwrite` still lists the colliding keys under a
+  `# WILL OVERWRITE` header so destructive intent is visible.
+- Empty values in the `.env` are filtered out (matching `put`'s
+  behaviour), so trailing `FOO=` lines don't trigger spurious
+  "would overwrite" noise.
+- Values never appear in dry-run output (names and `len=N` only);
+  there is a snapshot test pinning this property.
+- **If apply fails partway** — SSM put succeeds but `daemon-reload`
+  fails — the error tells you to `ssmm delete <app> -r` to revert the
+  SSM half. The systemd drop-in if written can be removed by
+  `rm <path>` (shown in the error).
+- **Use `migrate-to-exec` instead** when the app is already in SSM and
+  you only need to switch modes. `onboard`'s default-fail guard will
+  block you from double-putting.
+
 ## systemd integration
 
 Two shapes, pick based on threat model. Both work with user-scoped

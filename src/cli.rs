@@ -223,6 +223,69 @@ pub enum Command {
         #[command(subcommand)]
         action: TagAction,
     },
+    /// Onboard a new app: put .env into SSM + write systemd drop-in in one go.
+    ///
+    /// Combines `put --env <file>` and `migrate-to-exec` for greenfield apps
+    /// (app not yet in SSM). Dry-run by default; pass `--apply` to actually
+    /// write. Dry-run checks for existing SSM keys under the app prefix and
+    /// reports collisions regardless of `--overwrite`, so you can see what
+    /// will change before committing.
+    ///
+    /// Default behaviour is fail-if-any-key-exists, to prevent silently
+    /// rolling back a secret rotation that's already in SSM. Pass
+    /// `--overwrite` to opt into replace-existing semantics.
+    ///
+    /// For apps ALREADY in SSM that you just want to switch to exec-mode,
+    /// use `migrate-to-exec` instead — it skips the put step.
+    Onboard {
+        /// systemd unit name (e.g. `myapp.service`)
+        #[arg(long, value_name = "UNIT")]
+        unit: String,
+        /// SSM app name (dash-case tail of /<prefix>/<app>/...)
+        #[arg(long)]
+        app: String,
+        /// .env file to put into SSM (required; this is the onboard input)
+        #[arg(long, value_name = "PATH")]
+        env: PathBuf,
+        /// Full command to exec after SSM injection (paste ExecStart= from
+        /// `systemctl cat <unit>`)
+        #[arg(long, value_name = "CMD")]
+        exec_cmd: String,
+        /// Force ALL values to String (ignores per-key overrides and heuristic)
+        #[arg(long)]
+        plain_all: bool,
+        /// Force specific keys to String (repeatable)
+        #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
+        plain_keys: Vec<String>,
+        /// Force specific keys to SecureString (repeatable)
+        #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
+        secure_keys: Vec<String>,
+        /// Extra tags (repeatable: --tag env=prod). `app` tag is added automatically.
+        #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+        tags: Vec<String>,
+        /// Target system-wide systemd instead of --user
+        #[arg(long)]
+        system: bool,
+        /// EnvironmentFile= entries to keep (repeatable)
+        #[arg(long = "keep-env-file", action = ArgAction::Append, value_name = "PATH")]
+        keep_env_files: Vec<PathBuf>,
+        /// ExecStartPre= entries to set (repeatable)
+        #[arg(long = "pre-exec", action = ArgAction::Append, value_name = "CMD")]
+        pre_execs: Vec<String>,
+        /// Absolute path to ssmm binary used in generated ExecStart=.
+        /// Default: `$HOME/.cargo/bin/ssmm`.
+        #[arg(long, value_name = "PATH")]
+        ssmm_bin: Option<PathBuf>,
+        /// Replace existing SSM values if any keys already exist. Default:
+        /// fail on collision, so a prior secret rotation is not silently
+        /// overwritten. Has no effect when no collisions exist.
+        #[arg(long)]
+        overwrite: bool,
+        /// Actually perform put + write drop-in + daemon-reload.
+        /// Without this flag, prints the plan to stdout.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
