@@ -305,26 +305,28 @@ fn env_key_to_ssm_tail(key: &str) -> String {
     key.to_lowercase().replace('_', "-")
 }
 
+/// Heuristic: default to SecureString (conservative). Flip to String only for
+/// suffixes that strongly imply structural/public config (paths, hostnames,
+/// ports, region strings, Slack channel IDs, etc.).
+///
+/// `_url` is intentionally NOT in the safe list — URLs commonly embed
+/// credentials (e.g. `postgres://user:pass@host/db`, Slack webhook URLs,
+/// Sentry DSNs). Leaking them as plaintext SSM parameters is the #1
+/// real-world foot-gun. Users who want plaintext storage can pass
+/// `--plain KEY` explicitly.
 fn should_be_secure(key: &str) -> bool {
     let lc = key.to_lowercase();
-    if lc.contains("webhook") {
-        return true;
-    }
     const NON_SECRET_SUFFIXES: &[&str] = &[
         "_path",
-        "_url",
+        "_dir",
         "_channel",
         "_name",
         "_host",
         "_port",
         "_region",
         "_endpoint",
-        "_dir",
     ];
-    if NON_SECRET_SUFFIXES.iter().any(|s| lc.ends_with(s)) {
-        return false;
-    }
-    true
+    !NON_SECRET_SUFFIXES.iter().any(|s| lc.ends_with(s))
 }
 
 fn build_tag(k: &str, v: &str) -> Result<Tag> {
@@ -1245,19 +1247,25 @@ mod tests {
     }
 
     #[test]
-    fn should_be_secure_webhook_overrides_url_suffix() {
-        // webhook は _url suffix より優先 (secret 扱い)
+    fn should_be_secure_url_keys_are_secure() {
+        // v0.1.1: `_url` suffix はもはや safe list に無い。
+        // URL は credentials を含む可能性が高いため SecureString デフォルト
+        assert!(should_be_secure("DATABASE_URL"));
+        assert!(should_be_secure("POSTGRES_URL"));
         assert!(should_be_secure("SLACK_WEBHOOK_URL"));
+        assert!(should_be_secure("GOOGLE_SPREADSHEET_URL"));
+        assert!(should_be_secure("SENTRY_DSN"));
     }
 
     #[test]
     fn should_be_secure_public_suffixes_map_to_string() {
         assert!(!should_be_secure("GOOGLE_CREDENTIALS_PATH"));
-        assert!(!should_be_secure("GOOGLE_SPREADSHEET_URL"));
         assert!(!should_be_secure("SLACK_CHANNEL"));
         assert!(!should_be_secure("DB_HOST"));
         assert!(!should_be_secure("HTTP_PORT"));
         assert!(!should_be_secure("AWS_REGION"));
+        assert!(!should_be_secure("LOG_DIR"));
+        assert!(!should_be_secure("API_ENDPOINT"));
     }
 
     #[test]

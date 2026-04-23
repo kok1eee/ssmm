@@ -1,11 +1,11 @@
 [package]
 name = "ssmm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "AWS SSM Parameter Store helper for team-scoped .env sync (systemd friendly)"
 license = "MIT"
-repository = "https://github.com/dmm-com/ssmm"
-homepage = "https://github.com/dmm-com/ssmm"
+repository = "https://github.com/kok1eee/ssmm"
+homepage = "https://github.com/kok1eee/ssmm"
 readme = "README.md"
 keywords = ["aws", "ssm", "parameter-store", "dotenv", "systemd"]
 categories = ["command-line-utilities", "config"]

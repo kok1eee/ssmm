@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-23
+
+### Fixed
+
+- `cargo install --git` URL in README now points to `kok1eee/ssmm`
+  (previously incorrect `dmm-com/ssmm`). `Cargo.toml` `repository` /
+  `homepage` metadata also corrected so crates.io links resolve
+
+### Changed (security)
+
+- `_url` suffix no longer falls through to `String` auto-detection.
+  URLs routinely embed credentials (`postgres://user:pass@...`, Slack
+  webhooks, Sentry DSNs); defaulting them to plaintext SSM storage was
+  the #1 realistic foot-gun. `_url` keys now default to `SecureString`.
+  Existing parameters in SSM are unaffected — only the `put`-time
+  classification changes. Explicit override still available via `--plain KEY`
+- `webhook` special-case is now redundant (all `_url` keys are already
+  secure by default) but kept as a safety net
+
+### Docs
+
+- README comparison table gained a **"Secrets materialized on disk"**
+  row making the ssmm-vs-chamber tradeoff explicit (ssmm: mode 0600
+  plaintext file; chamber: exec-time env injection, no disk). A
+  Security tradeoff callout was added so readers evaluate threat model
+  before drop-in replacing chamber / aws-vault
+
+### Tests
+
+- `should_be_secure_url_keys_are_secure` covers DATABASE_URL,
+  POSTGRES_URL, SLACK_WEBHOOK_URL, GOOGLE_SPREADSHEET_URL, SENTRY_DSN
+- `should_be_secure_public_suffixes_map_to_string` updated to reflect
+  the reduced safe list (added LOG_DIR / API_ENDPOINT; removed
+  GOOGLE_SPREADSHEET_URL)
+
 ## [0.1.0] - 2026-04-22
 
 Initial release.

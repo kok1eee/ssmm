@@ -24,9 +24,12 @@ Other opinions baked in:
   team namespace (for IAM policy scoping), the second is the app, and the key
   is flat (`kintone-api-token`, not `kintone/api/token`).
 - `SecureString` vs `String` is auto-detected from the key name (conservative:
-  unknown keys default to `SecureString`). `_path` / `_url` / `_channel` /
-  `_name` / `_host` / `_port` / `_region` / `_endpoint` / `_dir` suffixes map
-  to `String`; anything containing `webhook` stays `SecureString`.
+  unknown keys default to `SecureString`). Only structural-looking suffixes
+  (`_path` / `_dir` / `_channel` / `_name` / `_host` / `_port` / `_region` /
+  `_endpoint`) map to `String`. **`_url` is NOT in the safe list** since
+  URLs commonly embed credentials (e.g. `postgres://user:pass@host/db`,
+  Slack webhook URLs) — URL-bearing keys stay `SecureString` by default.
+  Override per key with `--plain KEY` if you really need plaintext.
 - Each parameter is automatically tagged `app=<app>` so you can filter
   cross-namespace by tag later.
 
@@ -35,7 +38,9 @@ Other opinions baked in:
 Requires Rust 1.77+ (or whatever supports `edition = "2024"`).
 
 ```bash
-cargo install --git https://github.com/dmm-com/ssmm
+cargo install ssmm          # from crates.io
+# or
+cargo install --git https://github.com/kok1eee/ssmm
 ```
 
 Your IAM role needs: `ssm:PutParameter`, `ssm:GetParametersByPath`,
@@ -152,10 +157,19 @@ backoff.
 | Backend                 | AWS SSM PS | AWS SSM PS / S3 | hosted |
 | Output model            | `.env` file | env vars at exec | `.env.vault` file |
 | systemd `EnvironmentFile` | ✅ native | needs `chamber exec` | no |
+| **Secrets materialized on disk** | **⚠️ yes (mode 0600)** | **no** (exec injection) | encrypted at rest |
 | Key namespace convention | `<team>/<app>/<key>` | `<service>/<key>` | env profile |
 | Tag management          | ✅ (`tag add/remove/list`) | — | — |
 | Cross-app shared values | `/shared/` + tag overlay | — | — |
 | Language                | Rust | Go | Node.js |
+
+> **Security tradeoff**: `ssmm sync` writes decrypted SecureString values
+> to a local file (mode 0600). This is a drop-in for plaintext `.env`
+> workflows, not a hardened secret manager. If your threat model includes
+> host compromise or backup exfiltration, prefer `chamber exec`-style
+> injection (values live only in process memory). `ssmm` buys you systemd
+> `EnvironmentFile=` compatibility and central SSM management at the cost
+> of plaintext-on-disk during process lifetime.
 
 ## License
 
