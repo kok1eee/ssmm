@@ -3,9 +3,9 @@ use aws_sdk_ssm::Client;
 use aws_sdk_ssm::types::{ParameterTier, ParameterType, ResourceTypeForTagging};
 use colored::Colorize;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use crate::app::{app_prefix, resolve_app};
+use crate::cli::PutArgs;
 use crate::config::{advanced_tier, kms_key_id, write_concurrency};
 use crate::env_map::{parse_kv_pairs, parse_tags, read_env_file};
 use crate::ssm::{build_param_name, build_tags, resolve_type};
@@ -107,17 +107,16 @@ pub async fn put_kvs(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_put(
-    client: &Client,
-    pairs: Vec<String>,
-    env: Option<PathBuf>,
-    app: Option<String>,
-    plain_all: bool,
-    plain_keys: Vec<String>,
-    secure_keys: Vec<String>,
-    raw_tags: Vec<String>,
-) -> Result<()> {
+pub async fn cmd_put(client: &Client, args: PutArgs) -> Result<()> {
+    let PutArgs {
+        pairs,
+        env,
+        app,
+        plain_all,
+        plain_keys,
+        secure_keys,
+        tags: raw_tags,
+    } = args;
     let app = resolve_app(app)?;
 
     let mut kvs: Vec<(String, String)> = if let Some(path) = env {

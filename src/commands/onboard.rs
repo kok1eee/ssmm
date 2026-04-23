@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::app::app_prefix;
+use crate::cli::{MigrateToExecArgs, OnboardArgs};
 use crate::config::prefix_root;
 use crate::env_map::{parse_tags, read_env_file};
 use crate::ssm::{TypeReason, build_param_name, get_parameters_by_path, resolve_type};
@@ -109,24 +110,23 @@ fn format_onboard_plan(plan: &OnboardPlan) -> String {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_onboard(
-    client: &Client,
-    unit: String,
-    app: String,
-    env: PathBuf,
-    exec_cmd: String,
-    plain_all: bool,
-    plain_keys: Vec<String>,
-    secure_keys: Vec<String>,
-    raw_tags: Vec<String>,
-    system: bool,
-    keep_env_files: Vec<PathBuf>,
-    pre_execs: Vec<String>,
-    ssmm_bin: Option<PathBuf>,
-    overwrite: bool,
-    apply: bool,
-) -> Result<()> {
+pub async fn cmd_onboard(client: &Client, args: OnboardArgs) -> Result<()> {
+    let OnboardArgs {
+        unit,
+        app,
+        env,
+        exec_cmd,
+        plain_all,
+        plain_keys,
+        secure_keys,
+        tags: raw_tags,
+        system,
+        keep_env_files,
+        pre_execs,
+        ssmm_bin,
+        overwrite,
+        apply,
+    } = args;
     let prefix = app_prefix(&app);
 
     // Collision detection (below) must run against the SAME filtered set that
@@ -259,16 +259,16 @@ pub async fn cmd_onboard(
         "{} writing systemd drop-in + daemon-reload",
         "[2/2]".bold()
     );
-    cmd_migrate_to_exec(
+    cmd_migrate_to_exec(MigrateToExecArgs {
         unit,
-        app.clone(),
+        app: app.clone(),
         exec_cmd,
         system,
         keep_env_files,
         pre_execs,
         ssmm_bin,
-        true,
-    )
+        apply: true,
+    })
     .map_err(|e| {
         anyhow!(
             "SSM values WERE written, but systemd step failed: {}\n\
@@ -305,21 +305,13 @@ mod tests {
         ])
         .expect("parse");
         match cli.command {
-            Command::Onboard {
-                unit,
-                app,
-                env,
-                exec_cmd,
-                apply,
-                overwrite,
-                ..
-            } => {
-                assert_eq!(unit, "myapp.service");
-                assert_eq!(app, "myapp");
-                assert_eq!(env.to_str().unwrap(), "/tmp/myapp.env");
-                assert_eq!(exec_cmd, "/usr/bin/echo hi");
-                assert!(!apply, "--apply defaults to false");
-                assert!(!overwrite, "--overwrite defaults to false");
+            Command::Onboard(args) => {
+                assert_eq!(args.unit, "myapp.service");
+                assert_eq!(args.app, "myapp");
+                assert_eq!(args.env.to_str().unwrap(), "/tmp/myapp.env");
+                assert_eq!(args.exec_cmd, "/usr/bin/echo hi");
+                assert!(!args.apply, "--apply defaults to false");
+                assert!(!args.overwrite, "--overwrite defaults to false");
             }
             _ => panic!("expected Onboard variant"),
         }

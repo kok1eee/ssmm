@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -59,28 +59,7 @@ pub enum Command {
         tags: Vec<String>,
     },
     /// Put parameters from .env or KEY=VALUE pairs
-    Put {
-        #[arg(value_name = "KEY=VALUE")]
-        pairs: Vec<String>,
-        /// Read KEY=VALUE pairs from a .env file
-        #[arg(long)]
-        env: Option<PathBuf>,
-        #[arg(long)]
-        app: Option<String>,
-        /// Force ALL values to String (ignores per-key overrides and heuristic)
-        #[arg(long)]
-        plain_all: bool,
-        /// Force specific keys to String (repeatable: --plain-key LOG_DIR --plain-key DB_HOST)
-        #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
-        plain_keys: Vec<String>,
-        /// Force specific keys to SecureString (repeatable: --secure DATABASE_URL)
-        #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
-        secure_keys: Vec<String>,
-        /// Extra tags (repeatable: --tag env=prod --tag owner=backend)
-        /// `app` tag is always attached automatically.
-        #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
-        tags: Vec<String>,
-    },
+    Put(PutArgs),
     /// Delete parameters
     Delete {
         target: String,
@@ -130,40 +109,7 @@ pub enum Command {
     /// since systemd's show/cat output is fragile across versions and
     /// drop-in resets. Paste the command from `systemctl cat <unit>`
     /// into --exec-cmd.
-    MigrateToExec {
-        /// systemd unit name (e.g. `myapp.service`)
-        #[arg(long, value_name = "UNIT")]
-        unit: String,
-        /// SSM app name to inject (dash-case tail of /<prefix>/<app>/...)
-        #[arg(long)]
-        app: String,
-        /// Full command to exec after SSM injection. Paste the existing
-        /// `ExecStart=` value from `systemctl cat <unit>` here.
-        /// Example: --exec-cmd "/usr/bin/uv run python app.py --mode prod"
-        #[arg(long, value_name = "CMD")]
-        exec_cmd: String,
-        /// Target system-wide systemd instead of --user (default: user)
-        #[arg(long)]
-        system: bool,
-        /// EnvironmentFile= entries to keep (not SSM-derived, e.g. sdtab
-        /// common env). Repeatable. Written with `-` prefix so missing files
-        /// don't break startup.
-        #[arg(long = "keep-env-file", action = ArgAction::Append, value_name = "PATH")]
-        keep_env_files: Vec<PathBuf>,
-        /// ExecStartPre= entries to set (replaces any existing ExecStartPre).
-        /// Repeatable; order preserved. Omit to clear ExecStartPre entirely.
-        #[arg(long = "pre-exec", action = ArgAction::Append, value_name = "CMD")]
-        pre_execs: Vec<String>,
-        /// Absolute path to ssmm binary used in the generated ExecStart=.
-        /// Default: `$HOME/.cargo/bin/ssmm` (stable install location —
-        /// do not use a `target/release/` path, which `cargo clean` removes).
-        #[arg(long, value_name = "PATH")]
-        ssmm_bin: Option<PathBuf>,
-        /// Actually write the drop-in and run `systemctl daemon-reload`.
-        /// Without this flag the drop-in is printed to stdout.
-        #[arg(long)]
-        apply: bool,
-    },
+    MigrateToExec(MigrateToExecArgs),
     /// Exec a command with SSM parameters injected as env vars (no .env on disk)
     ///
     /// Resolves parameters the same way as `sync` (app + shared overlay +
@@ -237,55 +183,118 @@ pub enum Command {
     ///
     /// For apps ALREADY in SSM that you just want to switch to exec-mode,
     /// use `migrate-to-exec` instead — it skips the put step.
-    Onboard {
-        /// systemd unit name (e.g. `myapp.service`)
-        #[arg(long, value_name = "UNIT")]
-        unit: String,
-        /// SSM app name (dash-case tail of /<prefix>/<app>/...)
-        #[arg(long)]
-        app: String,
-        /// .env file to put into SSM (required; this is the onboard input)
-        #[arg(long, value_name = "PATH")]
-        env: PathBuf,
-        /// Full command to exec after SSM injection (paste ExecStart= from
-        /// `systemctl cat <unit>`)
-        #[arg(long, value_name = "CMD")]
-        exec_cmd: String,
-        /// Force ALL values to String (ignores per-key overrides and heuristic)
-        #[arg(long)]
-        plain_all: bool,
-        /// Force specific keys to String (repeatable)
-        #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
-        plain_keys: Vec<String>,
-        /// Force specific keys to SecureString (repeatable)
-        #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
-        secure_keys: Vec<String>,
-        /// Extra tags (repeatable: --tag env=prod). `app` tag is added automatically.
-        #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
-        tags: Vec<String>,
-        /// Target system-wide systemd instead of --user
-        #[arg(long)]
-        system: bool,
-        /// EnvironmentFile= entries to keep (repeatable)
-        #[arg(long = "keep-env-file", action = ArgAction::Append, value_name = "PATH")]
-        keep_env_files: Vec<PathBuf>,
-        /// ExecStartPre= entries to set (repeatable)
-        #[arg(long = "pre-exec", action = ArgAction::Append, value_name = "CMD")]
-        pre_execs: Vec<String>,
-        /// Absolute path to ssmm binary used in generated ExecStart=.
-        /// Default: `$HOME/.cargo/bin/ssmm`.
-        #[arg(long, value_name = "PATH")]
-        ssmm_bin: Option<PathBuf>,
-        /// Replace existing SSM values if any keys already exist. Default:
-        /// fail on collision, so a prior secret rotation is not silently
-        /// overwritten. Has no effect when no collisions exist.
-        #[arg(long)]
-        overwrite: bool,
-        /// Actually perform put + write drop-in + daemon-reload.
-        /// Without this flag, prints the plan to stdout.
-        #[arg(long)]
-        apply: bool,
-    },
+    Onboard(OnboardArgs),
+}
+
+#[derive(Args)]
+pub struct PutArgs {
+    #[arg(value_name = "KEY=VALUE")]
+    pub pairs: Vec<String>,
+    /// Read KEY=VALUE pairs from a .env file
+    #[arg(long)]
+    pub env: Option<PathBuf>,
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Force ALL values to String (ignores per-key overrides and heuristic)
+    #[arg(long)]
+    pub plain_all: bool,
+    /// Force specific keys to String (repeatable: --plain-key LOG_DIR --plain-key DB_HOST)
+    #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
+    pub plain_keys: Vec<String>,
+    /// Force specific keys to SecureString (repeatable: --secure DATABASE_URL)
+    #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
+    pub secure_keys: Vec<String>,
+    /// Extra tags (repeatable: --tag env=prod --tag owner=backend)
+    /// `app` tag is always attached automatically.
+    #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+    pub tags: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct MigrateToExecArgs {
+    /// systemd unit name (e.g. `myapp.service`)
+    #[arg(long, value_name = "UNIT")]
+    pub unit: String,
+    /// SSM app name to inject (dash-case tail of /<prefix>/<app>/...)
+    #[arg(long)]
+    pub app: String,
+    /// Full command to exec after SSM injection. Paste the existing
+    /// `ExecStart=` value from `systemctl cat <unit>` here.
+    /// Example: --exec-cmd "/usr/bin/uv run python app.py --mode prod"
+    #[arg(long, value_name = "CMD")]
+    pub exec_cmd: String,
+    /// Target system-wide systemd instead of --user (default: user)
+    #[arg(long)]
+    pub system: bool,
+    /// EnvironmentFile= entries to keep (not SSM-derived, e.g. sdtab
+    /// common env). Repeatable. Written with `-` prefix so missing files
+    /// don't break startup.
+    #[arg(long = "keep-env-file", action = ArgAction::Append, value_name = "PATH")]
+    pub keep_env_files: Vec<PathBuf>,
+    /// ExecStartPre= entries to set (replaces any existing ExecStartPre).
+    /// Repeatable; order preserved. Omit to clear ExecStartPre entirely.
+    #[arg(long = "pre-exec", action = ArgAction::Append, value_name = "CMD")]
+    pub pre_execs: Vec<String>,
+    /// Absolute path to ssmm binary used in the generated ExecStart=.
+    /// Default: `$HOME/.cargo/bin/ssmm` (stable install location —
+    /// do not use a `target/release/` path, which `cargo clean` removes).
+    #[arg(long, value_name = "PATH")]
+    pub ssmm_bin: Option<PathBuf>,
+    /// Actually write the drop-in and run `systemctl daemon-reload`.
+    /// Without this flag the drop-in is printed to stdout.
+    #[arg(long)]
+    pub apply: bool,
+}
+
+#[derive(Args)]
+pub struct OnboardArgs {
+    /// systemd unit name (e.g. `myapp.service`)
+    #[arg(long, value_name = "UNIT")]
+    pub unit: String,
+    /// SSM app name (dash-case tail of /<prefix>/<app>/...)
+    #[arg(long)]
+    pub app: String,
+    /// .env file to put into SSM (required; this is the onboard input)
+    #[arg(long, value_name = "PATH")]
+    pub env: PathBuf,
+    /// Full command to exec after SSM injection (paste ExecStart= from
+    /// `systemctl cat <unit>`)
+    #[arg(long, value_name = "CMD")]
+    pub exec_cmd: String,
+    /// Force ALL values to String (ignores per-key overrides and heuristic)
+    #[arg(long)]
+    pub plain_all: bool,
+    /// Force specific keys to String (repeatable)
+    #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
+    pub plain_keys: Vec<String>,
+    /// Force specific keys to SecureString (repeatable)
+    #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
+    pub secure_keys: Vec<String>,
+    /// Extra tags (repeatable: --tag env=prod). `app` tag is added automatically.
+    #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+    pub tags: Vec<String>,
+    /// Target system-wide systemd instead of --user
+    #[arg(long)]
+    pub system: bool,
+    /// EnvironmentFile= entries to keep (repeatable)
+    #[arg(long = "keep-env-file", action = ArgAction::Append, value_name = "PATH")]
+    pub keep_env_files: Vec<PathBuf>,
+    /// ExecStartPre= entries to set (repeatable)
+    #[arg(long = "pre-exec", action = ArgAction::Append, value_name = "CMD")]
+    pub pre_execs: Vec<String>,
+    /// Absolute path to ssmm binary used in generated ExecStart=.
+    /// Default: `$HOME/.cargo/bin/ssmm`.
+    #[arg(long, value_name = "PATH")]
+    pub ssmm_bin: Option<PathBuf>,
+    /// Replace existing SSM values if any keys already exist. Default:
+    /// fail on collision, so a prior secret rotation is not silently
+    /// overwritten. Has no effect when no collisions exist.
+    #[arg(long)]
+    pub overwrite: bool,
+    /// Actually perform put + write drop-in + daemon-reload.
+    /// Without this flag, prints the plan to stdout.
+    #[arg(long)]
+    pub apply: bool,
 }
 
 #[derive(Subcommand)]

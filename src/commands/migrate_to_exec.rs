@@ -2,20 +2,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use colored::Colorize;
 use std::path::PathBuf;
 
+use crate::cli::MigrateToExecArgs;
 use crate::config::prefix_root;
 use crate::systemd::{SystemdScope, build_drop_in};
 
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_migrate_to_exec(
-    unit: String,
-    app: String,
-    exec_cmd: String,
-    system: bool,
-    keep_env_files: Vec<PathBuf>,
-    pre_execs: Vec<String>,
-    ssmm_bin: Option<PathBuf>,
-    apply: bool,
-) -> Result<()> {
+pub fn cmd_migrate_to_exec(args: MigrateToExecArgs) -> Result<()> {
+    let MigrateToExecArgs {
+        unit,
+        app,
+        exec_cmd,
+        system,
+        keep_env_files,
+        pre_execs,
+        ssmm_bin,
+        apply,
+    } = args;
     let scope = if system {
         SystemdScope::System
     } else {

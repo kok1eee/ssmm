@@ -56,27 +56,7 @@ async fn main() -> Result<()> {
             keys_only,
             tags,
         } => commands::list::cmd_list(&client, app, all, keys_only, tags).await,
-        Command::Put {
-            pairs,
-            env,
-            app,
-            plain_all,
-            plain_keys,
-            secure_keys,
-            tags,
-        } => {
-            commands::put::cmd_put(
-                &client,
-                pairs,
-                env,
-                app,
-                plain_all,
-                plain_keys,
-                secure_keys,
-                tags,
-            )
-            .await
-        }
+        Command::Put(args) => commands::put::cmd_put(&client, args).await,
         Command::Delete {
             target,
             app,
@@ -99,25 +79,7 @@ async fn main() -> Result<()> {
             strict,
             cmd,
         } => commands::exec::cmd_exec(&client, app, no_shared, include_tags, strict, cmd).await,
-        Command::MigrateToExec {
-            unit,
-            app,
-            exec_cmd,
-            system,
-            keep_env_files,
-            pre_execs,
-            ssmm_bin,
-            apply,
-        } => commands::migrate_to_exec::cmd_migrate_to_exec(
-            unit,
-            app,
-            exec_cmd,
-            system,
-            keep_env_files,
-            pre_execs,
-            ssmm_bin,
-            apply,
-        ),
+        Command::MigrateToExec(args) => commands::migrate_to_exec::cmd_migrate_to_exec(args),
         Command::Migrate {
             old_prefix,
             new_prefix,
@@ -131,40 +93,6 @@ async fn main() -> Result<()> {
             show_values,
         } => commands::check::cmd_check(&client, duplicates, values, show_values).await,
         Command::Tag { action } => commands::tag::cmd_tag(&client, action).await,
-        Command::Onboard {
-            unit,
-            app,
-            env,
-            exec_cmd,
-            plain_all,
-            plain_keys,
-            secure_keys,
-            tags,
-            system,
-            keep_env_files,
-            pre_execs,
-            ssmm_bin,
-            overwrite,
-            apply,
-        } => {
-            commands::onboard::cmd_onboard(
-                &client,
-                unit,
-                app,
-                env,
-                exec_cmd,
-                plain_all,
-                plain_keys,
-                secure_keys,
-                tags,
-                system,
-                keep_env_files,
-                pre_execs,
-                ssmm_bin,
-                overwrite,
-                apply,
-            )
-            .await
-        }
+        Command::Onboard(args) => commands::onboard::cmd_onboard(&client, args).await,
     }
 }
