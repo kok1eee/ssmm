@@ -244,6 +244,13 @@ pub struct MigrateToExecArgs {
     /// Without this flag the drop-in is printed to stdout.
     #[arg(long)]
     pub apply: bool,
+    /// Omit `--app <app>` from the generated `ExecStart=` and emit
+    /// `WorkingDirectory=<cwd>` instead, so the running binary auto-detects
+    /// the app from the CWD basename. Handy for sdtab-driven drop-ins where
+    /// the unit's working directory already matches the app slug.
+    /// Uses `$PWD` at the time `ssmm migrate-to-exec` runs.
+    #[arg(long)]
+    pub cwd_app: bool,
 }
 
 #[derive(Args)]
@@ -295,6 +302,13 @@ pub struct OnboardArgs {
     /// Without this flag, prints the plan to stdout.
     #[arg(long)]
     pub apply: bool,
+    /// Omit `--app <app>` from the generated `ExecStart=` and emit
+    /// `WorkingDirectory=<cwd>` instead, so the running binary auto-detects
+    /// the app from the CWD basename. Handy for sdtab-driven drop-ins where
+    /// the unit's working directory already matches the app slug.
+    /// Uses `$PWD` at the time `ssmm onboard` runs.
+    #[arg(long)]
+    pub cwd_app: bool,
 }
 
 #[derive(Subcommand)]

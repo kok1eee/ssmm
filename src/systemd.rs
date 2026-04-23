@@ -45,6 +45,7 @@ pub fn build_drop_in(
     pre_execs: &[String],
     ssmm_bin: &Path,
     prefix_root: &str,
+    working_dir: Option<&Path>,
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(
@@ -58,6 +59,10 @@ pub fn build_drop_in(
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "[Service]");
+    // working_dir が指定されれば WorkingDirectory= を書き、ExecStart は --app 省略形。
+    if let Some(wd) = working_dir {
+        let _ = writeln!(out, "WorkingDirectory={}", wd.display());
+    }
     // SSM 由来の .env を読ませないため EnvironmentFile= を reset。
     // keep 指定があれば再追加 (`-` prefix でファイル欠如を許容)。
     let _ = writeln!(out, "EnvironmentFile=");
@@ -70,14 +75,29 @@ pub fn build_drop_in(
         let _ = writeln!(out, "ExecStartPre={}", cmd);
     }
     // ExecStart= を ssmm exec 経由に差し替え。
+    // working_dir が指定されていれば --app を省略し、ssmm 側が CWD basename から解決する。
     let _ = writeln!(out, "ExecStart=");
-    let _ = writeln!(
-        out,
-        "ExecStart={} exec --app {} -- {}",
-        ssmm_bin.display(),
-        app,
-        exec_cmd
-    );
+    if working_dir.is_some() {
+        let _ = writeln!(
+            out,
+            "ExecStart={} exec -- {}",
+            ssmm_bin.display(),
+            exec_cmd
+        );
+        let _ = writeln!(
+            out,
+            "# app={} (omitted from ExecStart; resolved from WorkingDirectory basename)",
+            app
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "ExecStart={} exec --app {} -- {}",
+            ssmm_bin.display(),
+            app,
+            exec_cmd
+        );
+    }
     // ssmm が prefix を解決できるように環境変数を注入。
     let _ = writeln!(out, "Environment=SSMM_PREFIX_ROOT={}", prefix_root);
     out
@@ -96,6 +116,7 @@ mod tests {
             &[],
             Path::new("/home/me/.cargo/bin/ssmm"),
             "/myteam",
+            None,
         );
         // reset 行が単独で存在し、再指定なしで下に進む
         assert!(
@@ -129,6 +150,7 @@ mod tests {
             ],
             Path::new("/usr/local/bin/ssmm"),
             "/myteam",
+            None,
         );
         assert!(out.contains("EnvironmentFile=-/home/you/.config/sdtab/env\n"));
         assert!(out.contains("EnvironmentFile=-/etc/defaults/billing\n"));
@@ -151,6 +173,7 @@ mod tests {
             &["/bin/pre".to_string()],
             Path::new("/ssmm"),
             "/root",
+            None,
         );
         let reset_env = out.find("\nEnvironmentFile=\n").expect("has env reset");
         let keep_env = out
@@ -166,5 +189,42 @@ mod tests {
             reset_pre < add_pre,
             "ExecStartPre= reset must precede add line"
         );
+    }
+
+    #[test]
+    fn build_drop_in_with_cwd_app_omits_app_flag_and_adds_working_dir() {
+        // --cwd-app 指定時の挙動: WorkingDirectory= が入り、ExecStart から --app が消える
+        let out = build_drop_in(
+            "hikken-schedule",
+            "/usr/bin/uv run python main.py --mode bashtv",
+            &[PathBuf::from("/home/ec2-user/.config/sdtab/env")],
+            &["/usr/bin/playwright install chromium".to_string()],
+            Path::new("/home/ec2-user/.cargo/bin/ssmm"),
+            "/amu-revo",
+            Some(Path::new("/home/ec2-user/amu-tazawa-scripts/hikken_schedule")),
+        );
+        assert!(
+            out.contains("WorkingDirectory=/home/ec2-user/amu-tazawa-scripts/hikken_schedule\n"),
+            "expected WorkingDirectory= line, got:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "ExecStart=/home/ec2-user/.cargo/bin/ssmm exec -- \
+                 /usr/bin/uv run python main.py --mode bashtv\n"
+            ),
+            "expected --app-less ExecStart, got:\n{out}"
+        );
+        assert!(
+            !out.contains("ExecStart=/home/ec2-user/.cargo/bin/ssmm exec --app"),
+            "--app must NOT appear in ExecStart when working_dir is set"
+        );
+        assert!(
+            out.contains("# app=hikken-schedule"),
+            "app comment should record the omitted app for human readers"
+        );
+        // WorkingDirectory は EnvironmentFile= reset より前に来る
+        let wd = out.find("WorkingDirectory=").expect("has WorkingDirectory");
+        let env_reset = out.find("\nEnvironmentFile=\n").expect("has env reset");
+        assert!(wd < env_reset);
     }
 }

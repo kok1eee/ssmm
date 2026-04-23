@@ -191,6 +191,30 @@ ssmm migrate-to-exec ... --apply
   `sdtab upgrade` が走ったとき `exec-mode.conf` が温存されるかは
   バージョン依存なので、初回移行後 1 度 `sdtab upgrade` を走らせて
   survives するか軽く確認しておくと安心。
+- **`--cwd-app` (v0.7.0+)**: 生成 drop-in に `WorkingDirectory=<CWD>` を
+  足して `ExecStart=` から `--app <app>` を省く。ssmm 実行側は
+  CWD basename (dash-case 変換後) を app として自動判定する。
+  sdtab の table で `cmd:` 行が短くなるのと、同じアプリを別モードで
+  2 つ unit 化するときに app 名の repetition が消える利点がある。
+  実行時の `$PWD` がそのまま `WorkingDirectory=` に書かれるので、
+  **repo ディレクトリ内で実行すること**。
+
+  ```bash
+  cd ~/amu-tazawa-scripts/hikken_schedule   # CWD basename = hikken_schedule
+  ssmm migrate-to-exec \
+    --unit sdtab-hikken-bashtv.service \
+    --app hikken-schedule \
+    --exec-cmd "<現行 ExecStart>" \
+    --cwd-app --apply
+  # ↳ 生成 drop-in:
+  #   WorkingDirectory=/home/ec2-user/amu-tazawa-scripts/hikken_schedule
+  #   ExecStart=/home/ec2-user/.cargo/bin/ssmm exec -- <現行 ExecStart>
+  #   # app=hikken-schedule (omitted from ExecStart; resolved from WorkingDirectory basename)
+  ```
+
+  注意: `ssmm put` 側の `--app` 省略は CWD basename 依存なので、sdtab で
+  自動化する unit ではなく手動の `ssmm put --env .env` でも同じ規約を
+  踏襲する必要がある。逆に言えば CWD 規約さえ守れば flag 入力量が減る。
 
 #### 3D. グリーンフィールド: `.env` → SSM + drop-in を 1 コマンド (`ssmm onboard`, v0.6.0+)
 
@@ -223,6 +247,9 @@ ssmm onboard ... --apply
   書いた drop-in は `rm <path>` で消せる (同じエラー内に path が出る)。
 - **SSM に既にある app には使わない**: default-fail ガードで弾かれる。
   モード切替だけなら `migrate-to-exec` を使う。
+- **`--cwd-app` (v0.7.0+)**: migrate-to-exec と同じ挙動。repo ディレクトリで
+  実行すると drop-in に `WorkingDirectory=<CWD>` を埋め、`ExecStart=` から
+  `--app` を外す。sdtab の table で cmd 列が短くなる。
 
 ### 4. 動作確認
 

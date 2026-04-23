@@ -16,6 +16,7 @@ pub fn cmd_migrate_to_exec(args: MigrateToExecArgs) -> Result<()> {
         pre_execs,
         ssmm_bin,
         apply,
+        cwd_app,
     } = args;
     let scope = if system {
         SystemdScope::System
@@ -37,6 +38,12 @@ pub fn cmd_migrate_to_exec(args: MigrateToExecArgs) -> Result<()> {
     let drop_in_dir = scope.drop_in_dir(&unit)?;
     let drop_in_path = drop_in_dir.join("exec-mode.conf");
 
+    let working_dir = if cwd_app {
+        Some(std::env::current_dir().context("resolve current_dir for --cwd-app")?)
+    } else {
+        None
+    };
+
     let content = build_drop_in(
         &app,
         &exec_cmd,
@@ -44,6 +51,7 @@ pub fn cmd_migrate_to_exec(args: MigrateToExecArgs) -> Result<()> {
         &pre_execs,
         &ssmm_bin,
         prefix_root(),
+        working_dir.as_deref(),
     );
 
     if !apply {

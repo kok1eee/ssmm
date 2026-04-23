@@ -169,6 +169,29 @@ ssmm migrate-to-exec ... --apply
   with sdtab's own `<unit>.d/v2-syslog-identifier.conf` style drop-ins.
   If you later run `sdtab upgrade`, verify `exec-mode.conf` survives —
   report back if it doesn't.
+- **`--cwd-app` (v0.7.0+)**: emit `WorkingDirectory=<cwd>` and drop
+  `--app <app>` from the generated `ExecStart=`. The running `ssmm`
+  auto-detects the app from the CWD basename, so the drop-in gets
+  shorter and sdtab tables stop having to repeat the app name in the
+  `cmd:` field. Run `ssmm migrate-to-exec --cwd-app` from inside the
+  app's repo directory (the path you'd `cd` into) — that path becomes
+  the drop-in's `WorkingDirectory=`.
+
+  ```bash
+  cd ~/amu-tazawa-scripts/hikken_schedule       # CWD basename = hikken_schedule → app hikken-schedule
+  ssmm migrate-to-exec \
+    --unit sdtab-hikken-bashtv.service \
+    --app hikken-schedule \
+    --exec-cmd "/home/ec2-user/.local/share/mise/shims/uv run python main_spreadsheet.py --mode bashtv" \
+    --pre-exec "/home/ec2-user/.local/bin/uv run playwright install chromium" \
+    --cwd-app --apply
+  ```
+
+  Resulting drop-in `ExecStart=` becomes:
+  ```
+  WorkingDirectory=/home/ec2-user/amu-tazawa-scripts/hikken_schedule
+  ExecStart=/home/ec2-user/.cargo/bin/ssmm exec -- /home/ec2-user/.local/share/mise/shims/uv run python main_spreadsheet.py --mode bashtv
+  ```
 
 ## Onboarding a greenfield app in one command
 
@@ -207,6 +230,11 @@ ssmm onboard ... --apply
 - **Use `migrate-to-exec` instead** when the app is already in SSM and
   you only need to switch modes. `onboard`'s default-fail guard will
   block you from double-putting.
+- **`--cwd-app` (v0.7.0+)** works the same as on `migrate-to-exec`:
+  the generated drop-in gets `WorkingDirectory=<cwd>` and the
+  `ExecStart=` omits `--app`, so the `cmd:` column in a sdtab table
+  no longer needs to repeat the app slug. Run `ssmm onboard --cwd-app`
+  from inside the app's repo directory.
 
 ## systemd integration
 

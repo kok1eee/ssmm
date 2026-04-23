@@ -128,6 +128,7 @@ pub async fn cmd_onboard(client: &Client, args: OnboardArgs) -> Result<()> {
         ssmm_bin,
         overwrite,
         apply,
+        cwd_app,
     } = args;
     let prefix = app_prefix(&app);
 
@@ -198,6 +199,11 @@ pub async fn cmd_onboard(client: &Client, args: OnboardArgs) -> Result<()> {
     };
     let drop_in_dir = scope.drop_in_dir(&unit)?;
     let drop_in_path = drop_in_dir.join("exec-mode.conf");
+    let working_dir = if cwd_app {
+        Some(std::env::current_dir().context("resolve current_dir for --cwd-app")?)
+    } else {
+        None
+    };
     let drop_in_content = build_drop_in(
         &app,
         &exec_cmd,
@@ -205,6 +211,7 @@ pub async fn cmd_onboard(client: &Client, args: OnboardArgs) -> Result<()> {
         &pre_execs,
         &resolved_ssmm_bin,
         prefix_root(),
+        working_dir.as_deref(),
     );
 
     if !apply {
@@ -263,6 +270,7 @@ pub async fn cmd_onboard(client: &Client, args: OnboardArgs) -> Result<()> {
         pre_execs,
         ssmm_bin,
         apply: true,
+        cwd_app,
     })
     .map_err(|e| {
         anyhow!(

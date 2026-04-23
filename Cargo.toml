@@ -1,6 +1,6 @@
 [package]
 name = "ssmm"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "AWS SSM Parameter Store helper for team-scoped .env sync (systemd friendly)"
 license = "MIT"
