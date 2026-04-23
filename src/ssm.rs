@@ -23,6 +23,10 @@ pub fn env_key_to_ssm_tail(key: &str) -> String {
     key.to_lowercase().replace('_', "-")
 }
 
+pub fn build_param_name(prefix: &str, env_key: &str) -> String {
+    format!("{}/{}", prefix, env_key_to_ssm_tail(env_key))
+}
+
 /// Heuristic: default to SecureString (conservative). Flip to String only for
 /// suffixes that strongly imply structural/public config (paths, hostnames,
 /// ports, region strings, Slack channel IDs, etc.).

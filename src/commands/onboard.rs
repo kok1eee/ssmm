@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use crate::app::app_prefix;
 use crate::config::prefix_root;
 use crate::env_map::{parse_tags, read_env_file};
-use crate::ssm::{TypeReason, env_key_to_ssm_tail, get_parameters_by_path, resolve_type};
+use crate::ssm::{TypeReason, build_param_name, get_parameters_by_path, resolve_type};
 use crate::systemd::{SystemdScope, build_drop_in};
 
 use super::migrate_to_exec::cmd_migrate_to_exec;
-use super::put::cmd_put;
+use super::put::put_kvs;
 
 struct OnboardPlan<'a> {
     app: &'a str,
@@ -73,7 +73,7 @@ fn format_onboard_plan(plan: &OnboardPlan) -> String {
         format!("[app={}, {}]", plan.app, extras)
     };
     for (k, v) in plan.kvs {
-        let name = format!("{}/{}", plan.prefix, env_key_to_ssm_tail(k));
+        let name = build_param_name(plan.prefix, k);
         let (ptype, reason) = resolve_type(k, plan.plain_all, plan.plain_keys, plan.secure_keys);
         let type_label = match ptype {
             ParameterType::SecureString => "SecureString",
@@ -129,9 +129,9 @@ pub async fn cmd_onboard(
 ) -> Result<()> {
     let prefix = app_prefix(&app);
 
-    // 1. Parse + filter empty values BEFORE collision detection
-    //    (cmd_put skips empty values internally; collision check must match
-    //    actual put behaviour to avoid spurious "would overwrite" noise)
+    // Collision detection (below) must run against the SAME filtered set that
+    // put_kvs will actually put. Filter empty values here so a trailing FOO=
+    // in the .env doesn't show up as a spurious "would overwrite".
     let mut kvs = read_env_file(&env)?;
     let before = kvs.len();
     kvs.retain(|(_, v)| !v.is_empty());
@@ -145,8 +145,8 @@ pub async fn cmd_onboard(
         bail!("no key=value in {} after filtering empty values", env.display());
     }
 
-    let plain_set: HashSet<String> = plain_keys.iter().cloned().collect();
-    let secure_set: HashSet<String> = secure_keys.iter().cloned().collect();
+    let plain_set: HashSet<String> = plain_keys.into_iter().collect();
+    let secure_set: HashSet<String> = secure_keys.into_iter().collect();
     if let Some(c) = plain_set.intersection(&secure_set).next() {
         bail!(
             "key {:?} is listed in both --plain-key and --secure; pick one",
@@ -158,11 +158,11 @@ pub async fn cmd_onboard(
         bail!("`app` tag is reserved; do not pass --tag app=...");
     }
 
-    // 2. Collision detection (runs ALWAYS, including --overwrite, so dry-run
-    //    shows "will overwrite N keys" even in overwrite mode)
+    // Collision check runs ALWAYS, including under --overwrite, so the dry-run
+    // "WILL OVERWRITE N keys" banner shows destructive intent before --apply.
     let desired: HashSet<String> = kvs
         .iter()
-        .map(|(k, _)| format!("{}/{}", prefix, env_key_to_ssm_tail(k)))
+        .map(|(k, _)| build_param_name(&prefix, k))
         .collect();
     let existing = get_parameters_by_path(client, &prefix).await?;
     let mut collisions: Vec<String> = existing
@@ -173,7 +173,6 @@ pub async fn cmd_onboard(
         .collect();
     collisions.sort();
 
-    // 3. Fail early if collisions && !overwrite (default-safe)
     if !collisions.is_empty() && !overwrite {
         bail!(
             "{} existing SSM key(s) under {} would be overwritten:\n  {}\n\n\
@@ -186,7 +185,6 @@ pub async fn cmd_onboard(
         );
     }
 
-    // 4. Resolve ssmm_bin + build drop-in content
     let resolved_ssmm_bin = ssmm_bin
         .clone()
         .or_else(|| {
@@ -214,7 +212,6 @@ pub async fn cmd_onboard(
         prefix_root(),
     );
 
-    // 5. Dry-run: print plan and exit
     if !apply {
         let revert_cmd = format!(
             "rm {} && systemctl {} daemon-reload",
@@ -239,22 +236,20 @@ pub async fn cmd_onboard(
         return Ok(());
     }
 
-    // 6. Apply: put → migrate-to-exec, with partial-failure guidance
     println!(
         "{} putting {} key(s) to SSM (app={})",
         "[1/2]".bold(),
         kvs.len(),
         app
     );
-    cmd_put(
+    put_kvs(
         client,
-        Vec::new(),
-        Some(env),
-        Some(app.clone()),
+        &kvs,
+        &app,
         plain_all,
-        plain_keys,
-        secure_keys,
-        raw_tags,
+        &plain_set,
+        &secure_set,
+        &extra_tags,
     )
     .await
     .context("SSM put failed; systemd step was not attempted")?;
