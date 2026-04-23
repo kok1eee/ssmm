@@ -8,7 +8,7 @@ use crate::app::{app_prefix, resolve_app};
 use crate::cli::PutArgs;
 use crate::config::{advanced_tier, kms_key_id, write_concurrency};
 use crate::env_map::{parse_kv_pairs, parse_tags, read_env_file};
-use crate::ssm::{build_param_name, build_tags, resolve_type};
+use crate::ssm::{build_param_name, build_plain_secure_sets, build_tags, resolve_type};
 use crate::util::run_bounded;
 
 /// Put a pre-parsed, pre-filtered batch of (key, value) pairs to SSM under
@@ -149,14 +149,7 @@ pub async fn cmd_put(client: &Client, args: PutArgs) -> Result<()> {
         bail!("no key=value to put");
     }
 
-    let plain_set: HashSet<String> = plain_keys.into_iter().collect();
-    let secure_set: HashSet<String> = secure_keys.into_iter().collect();
-    if let Some(conflict) = plain_set.intersection(&secure_set).next() {
-        bail!(
-            "key {:?} is listed in both --plain-key and --secure; pick one",
-            conflict
-        );
-    }
+    let (plain_set, secure_set) = build_plain_secure_sets(plain_keys, secure_keys)?;
 
     let extra_tags = parse_tags(&raw_tags)?;
     if extra_tags.iter().any(|(k, _)| k == "app") {

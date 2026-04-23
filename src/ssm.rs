@@ -85,6 +85,24 @@ impl TypeReason {
     }
 }
 
+/// Convert CLI-sourced `--plain-key` / `--secure` vectors into deduped sets
+/// and reject overlap. Centralised so cmd_put and cmd_onboard stay in sync
+/// on the error message if a key is listed on both sides.
+pub fn build_plain_secure_sets(
+    plain_keys: Vec<String>,
+    secure_keys: Vec<String>,
+) -> Result<(HashSet<String>, HashSet<String>)> {
+    let plain: HashSet<String> = plain_keys.into_iter().collect();
+    let secure: HashSet<String> = secure_keys.into_iter().collect();
+    if let Some(conflict) = plain.intersection(&secure).next() {
+        anyhow::bail!(
+            "key {:?} is listed in both --plain-key and --secure; pick one",
+            conflict
+        );
+    }
+    Ok((plain, secure))
+}
+
 pub fn resolve_type(
     key: &str,
     plain_all: bool,

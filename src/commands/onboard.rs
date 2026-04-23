@@ -10,7 +10,9 @@ use crate::app::app_prefix;
 use crate::cli::{MigrateToExecArgs, OnboardArgs};
 use crate::config::prefix_root;
 use crate::env_map::{parse_tags, read_env_file};
-use crate::ssm::{TypeReason, build_param_name, get_parameters_by_path, resolve_type};
+use crate::ssm::{
+    TypeReason, build_param_name, build_plain_secure_sets, get_parameters_by_path, resolve_type,
+};
 use crate::systemd::{SystemdScope, build_drop_in};
 
 use super::migrate_to_exec::cmd_migrate_to_exec;
@@ -145,14 +147,7 @@ pub async fn cmd_onboard(client: &Client, args: OnboardArgs) -> Result<()> {
         bail!("no key=value in {} after filtering empty values", env.display());
     }
 
-    let plain_set: HashSet<String> = plain_keys.into_iter().collect();
-    let secure_set: HashSet<String> = secure_keys.into_iter().collect();
-    if let Some(c) = plain_set.intersection(&secure_set).next() {
-        bail!(
-            "key {:?} is listed in both --plain-key and --secure; pick one",
-            c
-        );
-    }
+    let (plain_set, secure_set) = build_plain_secure_sets(plain_keys, secure_keys)?;
     let extra_tags = parse_tags(&raw_tags)?;
     if extra_tags.iter().any(|(k, _)| k == "app") {
         bail!("`app` tag is reserved; do not pass --tag app=...");
