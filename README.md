@@ -2,6 +2,8 @@
 
 [![build](https://img.shields.io/badge/build-cargo-orange)]() [![license](https://img.shields.io/badge/license-MIT-blue)]()
 
+📖 **English** · [日本語](README.ja.md)
+
 A small Rust CLI that treats AWS SSM Parameter Store as the source of truth
 for a team's `.env` files, with a flat-key convention and tag-based overlays.
 
