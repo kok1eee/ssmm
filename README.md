@@ -12,11 +12,16 @@ enough to remove a lot of shell-script boilerplate.
 
 ## Why another SSM wrapper?
 
-`ssmm` **materializes a `.env` file** on disk (mode 0600) that systemd
-loads via `EnvironmentFile=`. That makes it a drop-in replacement for
-plaintext `.env` in existing systemd-based deployments without changing
-the apps themselves. See [Security model](#security-model) for the
-disk-materialization tradeoff.
+Two delivery modes, same prefix convention and overlay rules:
+
+- **`ssmm sync`** materializes a `.env` file (mode 0600) that systemd loads
+  via `EnvironmentFile=`. Drop-in replacement for plaintext `.env` with zero
+  app-side changes.
+- **`ssmm exec`** injects SSM values directly into a child process's
+  environment via `execvp` — no file on disk. Use when your threat model
+  disallows plaintext secrets on the filesystem.
+
+See [Security model](#security-model) for the tradeoff.
 
 Other opinions baked in:
 
@@ -97,6 +102,12 @@ ssmm sync --out ./.env
 # (good for systemd ExecStartPre — you want the service to FAIL, not silently diverge)
 ssmm sync --out ./.env --strict
 
+# Or skip the .env file entirely — SSM → process env directly (chamber-style).
+# Parent env is inherited; SSM values overlay. Values never touch disk.
+ssmm exec -- ./run.sh --flag value       # use `--` so child flags aren't eaten
+ssmm exec --app myapp --include-tag shared=true -- python -m myapp
+# stderr: ssmm: exec ./run.sh with 10 variables (app=10, shared=0, tag=0)
+
 # Show one
 ssmm show kintone-api-token
 
@@ -118,9 +129,53 @@ ssmm migrate /old-prefix/app /myteam/app --delete-old         # step 2: dry-run 
 ssmm migrate /old-prefix/app /myteam/app --delete-old --confirm  # step 3: actually delete sources
 ```
 
+## Migrating an existing sync unit to exec mode
+
+If you already have units running in sync mode (`ExecStartPre=ssmm sync ...` +
+`EnvironmentFile=...env`) and want to switch to exec mode, generate the
+drop-in with `ssmm migrate-to-exec` instead of hand-editing:
+
+```bash
+# dry-run (default): prints the proposed drop-in
+ssmm migrate-to-exec \
+  --unit myapp.service \
+  --app myapp \
+  --exec-cmd "/usr/bin/uv run python app.py --mode prod" \
+  --keep-env-file /etc/defaults/common \
+  --pre-exec "/usr/bin/playwright install chromium"
+
+# actually write the drop-in and reload systemd
+ssmm migrate-to-exec ... --apply
+```
+
+- `--exec-cmd` is the command to run after SSM injection. Paste the
+  existing `ExecStart=` value from `systemctl cat <unit>` verbatim; ssmm
+  deliberately does not auto-parse systemd's output since `show` / `cat`
+  format differs across versions and drop-in resets.
+- `--keep-env-file PATH` preserves non-SSM `EnvironmentFile=` entries
+  (e.g. a machine-wide PATH setup). Everything else is cleared so the
+  old `.env` stops being read.
+- `--pre-exec CMD` repopulates `ExecStartPre=` after clearing it; useful
+  when the original `ExecStartPre` mixed `ssmm sync` with other prep
+  steps (playwright install, cache warm-up) — list only the steps you
+  still need.
+- `--apply` writes `<drop-in-dir>/exec-mode.conf` and runs
+  `systemctl [--user|--system] daemon-reload`. Without `--apply` it's a
+  pure stdout dry-run.
+- **Revert is one command**: `rm <drop-in> && systemctl daemon-reload`.
+- Tested against sdtab-managed units; the generated drop-in coexists
+  with sdtab's own `<unit>.d/v2-syslog-identifier.conf` style drop-ins.
+  If you later run `sdtab upgrade`, verify `exec-mode.conf` survives —
+  report back if it doesn't.
+
 ## systemd integration
 
+Two shapes, pick based on threat model. Both work with user-scoped
+systemd units (as shown below) and system units alike.
+
 ```ini
+# (a) sync-mode — drops a mode-0600 .env next to the app, then starts it.
+# Existing apps that read EnvironmentFile= work unchanged.
 # ~/.config/systemd/user/myapp.service
 [Service]
 Environment=SSMM_PREFIX_ROOT=/myteam
@@ -129,8 +184,23 @@ EnvironmentFile=/opt/myapp/.env
 ExecStart=/opt/myapp/run.sh
 ```
 
-`ssmm sync` is idempotent: if the generated content matches the existing
-file byte-for-byte, it's a no-op (`ssmm: no change`).
+```ini
+# (b) exec-mode — no .env on disk; ssmm exec replaces itself with the app,
+# passing SSM values via environ. Use when plaintext-on-disk is unacceptable.
+[Service]
+Environment=SSMM_PREFIX_ROOT=/myteam
+ExecStart=/home/you/.cargo/bin/ssmm exec --app myapp -- /opt/myapp/run.sh
+```
+
+Notes:
+
+- `ssmm sync` is idempotent: if the generated content matches the existing
+  file byte-for-byte, it's a no-op (`ssmm: no change`).
+- `ssmm exec` uses `execvp` so systemd sees the child process directly —
+  `Type=simple` semantics, signal delivery, MainPID, and journal output all
+  work as if systemd had started the app itself. No supervisor wrapper.
+- Always put `--` before the child command in exec mode, so flags for the
+  child (`--port`, `-H`, etc.) are not consumed by ssmm.
 
 ## Shared namespace and tag overlays
 
@@ -203,7 +273,8 @@ Notes:
 ## Security model
 
 `ssmm` is **not a hardened secret manager**. It's a `.env`-compatible
-convenience layer over SSM. Decide based on your threat model.
+convenience layer over SSM. Decide based on your threat model, and pick
+the right delivery mode (`sync` or `exec`).
 
 ### What `ssmm sync` actually does
 
@@ -217,41 +288,57 @@ the file. Decrypted SecureString values live:
    `EnvironmentFile=` (→ readable via `/proc/<pid>/environ` to the same
    UID / root)
 
-### What this protects against
+### What `ssmm exec` actually does
+
+`ssmm exec` performs the same `GetParametersByPath` + decryption, but
+then `execvp`s the child command with SSM values added to the inherited
+environment. Decrypted SecureString values live:
+
+1. In memory on the host during the SSM fetch
+2. In the child process's environment (readable via `/proc/<pid>/environ`
+   to the same UID / root)
+
+Specifically, **step 2 of `sync` — the on-disk file — does not exist
+under `exec`**. That is the primary difference between the two modes.
+
+### What either mode protects against
 
 - Accidental commit of plaintext `.env` to git (SSM is the source of truth)
 - Unauthorized teammates who have SSM read permission but not host login
 - Drift between hosts (central management vs hand-copied `.env` files)
 
-### What this does NOT protect against
+### What neither mode protects against
 
-- **Host compromise**: attacker with filesystem read on the host sees
-  plaintext `.env` and the process environment
-- **Backup exfiltration**: if you back up `/opt/myapp/` or `/home/<user>/`,
-  plaintext secrets may end up in your backup storage
-- **Same-host other processes under the same UID**: `/proc/<pid>/environ`
-  is readable by same-UID processes
+- **Same-UID process snooping**: `/proc/<pid>/environ` is readable by
+  same-UID processes (and root). Both modes expose values here once the
+  app is running.
+- **Host compromise**: attacker with filesystem read sees the process
+  environment; under `sync` they also see the plaintext `.env`.
 - **Systemd journal / CloudWatch log exfiltration**: `ssmm` is designed
   so that parameter **values never appear in error messages or log output**
   (only parameter names / counts / lengths / SHA-256 hashes). If you find
   a path that does leak values into stderr or journalctl, please open an
   issue — it's considered a bug. When integrating with CloudWatch /
   fluent-bit / Datadog logs, verify your own wrappers also preserve this
-  discipline
+  discipline.
 
-### If your threat model is stricter
+### What `exec` additionally protects against (vs `sync`)
 
-Consider tools that never materialize decrypted values on disk:
+- **Backup exfiltration**: no plaintext file, so `/opt/myapp/` backups
+  don't leak secrets (unless the backup also captures process memory /
+  `/proc`, which is uncommon).
+- **Unauthorized file read by a different UID on the same host**: the
+  sync'd `.env` is 0600 but still a file. `exec`-mode values only exist
+  in the process's environ, protected by kernel process isolation.
 
-- **[chamber](https://github.com/segmentio/chamber)** (Segment) — reads
-  SSM at `exec` time and injects env vars; nothing on disk
-- **[aws-vault](https://github.com/99designs/aws-vault)** — similar
-  approach for AWS credentials
-- **SOPS + age/KMS** — encrypted-at-rest files, decrypt-on-read
+### If your threat model is stricter than either mode
 
-`ssmm`'s niche is specifically *systemd `EnvironmentFile=` drop-in
-replacement for plaintext `.env`*. If you don't need that integration,
-the tools above may fit your threat model better.
+Consider tools that avoid even same-UID environ exposure:
+
+- **HashiCorp Vault + agent** — short-lived leases, audit logs
+- **SOPS + age/KMS** — encrypted-at-rest files, decrypt in-app only
+- **Runtime secret brokers** (AWS Secrets Manager SDK called from within
+  the app, rotated values, scoped to short-lived in-memory handling)
 
 ## Similar tools
 
@@ -259,28 +346,36 @@ I haven't benchmarked against the following in detail, so treat this
 as orientation, not authoritative comparison. Issues / PRs welcome if
 my positioning is wrong:
 
-- **chamber** — exec-time env var injection, no on-disk file
-- **aws-vault** — AWS credential focus, related design
-- **dotenv-vault** — hosted `.env.vault` format
+- **[chamber](https://github.com/segmentio/chamber)** — SSM-backed
+  exec-time env injection. `ssmm exec` is the equivalent mode in `ssmm`
+  (same underlying mechanism: decrypt + `execvp` + env overlay). `ssmm`
+  adds a 3-segment prefix convention `/<team>/<app>/<key>`, a shared
+  namespace, and tag overlays that chamber does not model.
+- **[aws-vault](https://github.com/99designs/aws-vault)** — exec-time
+  AWS credential injection. Different problem (IAM credentials vs. app
+  secrets) but the same "no plaintext on disk" philosophy.
+- **dotenv-vault** — hosted `.env.vault` format; not AWS-native.
+- **HashiCorp Vault** — full secret lifecycle management (leasing,
+  rotation, audit). Different tier of tool.
 
 ### Choose ssmm when
 
-1. You already have multiple **systemd services** consuming `.env` via
-   `EnvironmentFile=`
-2. Migrating to `chamber exec` would require touching every unit
-   definition across teams
-3. You accept the **on-disk materialization** tradeoff (mode 0600
-   plaintext file) in exchange for **zero app-side changes**
-4. You want a team-scoped prefix (`/<team>/<app>/<key>`) and
-   CWD-auto-detection by default
+1. Your team keeps **multiple services** that share a secret namespace
+   and you want a prefix convention (`/<team>/<app>/<key>`) with IAM
+   policy scoping at the team boundary.
+2. You want **both** `.env` file generation (for legacy `EnvironmentFile=`
+   consumers) **and** chamber-style exec-time injection from one tool,
+   with one IAM policy and one mental model.
+3. You want CWD-auto-detection of the app name, a shared namespace for
+   cross-app values, and tag-based overlays out of the box.
 
 ### Choose something else when
 
-- Your threat model disallows any plaintext secret on disk → use
-  `chamber exec` or SOPS-with-age
-- You only have a handful of services and can change them → `chamber
-  exec` is simpler
-- You're not on AWS → `dotenv-vault` or SOPS
+- You need secret rotation, leasing, or audit logs → HashiCorp Vault.
+- You're not on AWS → SOPS + age, dotenv-vault, or Doppler.
+- Your app needs to fetch secrets at runtime (not at process start) →
+  call the AWS Secrets Manager / Parameter Store SDK directly from the
+  app.
 
 ## Claude Code skill (bundled)
 

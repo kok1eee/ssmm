@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -190,6 +191,84 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Generate a systemd drop-in that switches a unit from sync-mode
+    /// (EnvironmentFile= .env) to exec-mode (`ssmm exec` direct injection).
+    ///
+    /// By default this is a dry-run: the drop-in is printed to stdout. Pass
+    /// `--apply` to write the file and run `systemctl daemon-reload`. Revert
+    /// by removing the drop-in file and reloading:
+    ///
+    ///     rm ~/.config/systemd/user/<unit>.d/exec-mode.conf && \
+    ///         systemctl --user daemon-reload
+    ///
+    /// ssmm deliberately does NOT auto-parse the current unit's ExecStart,
+    /// since systemd's show/cat output is fragile across versions and
+    /// drop-in resets. Paste the command from `systemctl cat <unit>`
+    /// into --exec-cmd.
+    MigrateToExec {
+        /// systemd unit name (e.g. `myapp.service`)
+        #[arg(long, value_name = "UNIT")]
+        unit: String,
+        /// SSM app name to inject (dash-case tail of /<prefix>/<app>/...)
+        #[arg(long)]
+        app: String,
+        /// Full command to exec after SSM injection. Paste the existing
+        /// `ExecStart=` value from `systemctl cat <unit>` here.
+        /// Example: --exec-cmd "/usr/bin/uv run python app.py --mode prod"
+        #[arg(long, value_name = "CMD")]
+        exec_cmd: String,
+        /// Target system-wide systemd instead of --user (default: user)
+        #[arg(long)]
+        system: bool,
+        /// EnvironmentFile= entries to keep (not SSM-derived, e.g. sdtab
+        /// common env). Repeatable. Written with `-` prefix so missing files
+        /// don't break startup.
+        #[arg(long = "keep-env-file", action = ArgAction::Append, value_name = "PATH")]
+        keep_env_files: Vec<PathBuf>,
+        /// ExecStartPre= entries to set (replaces any existing ExecStartPre).
+        /// Repeatable; order preserved. Omit to clear ExecStartPre entirely.
+        #[arg(long = "pre-exec", action = ArgAction::Append, value_name = "CMD")]
+        pre_execs: Vec<String>,
+        /// Absolute path to ssmm binary used in the generated ExecStart=.
+        /// Default: `$HOME/.cargo/bin/ssmm` (stable install location —
+        /// do not use a `target/release/` path, which `cargo clean` removes).
+        #[arg(long, value_name = "PATH")]
+        ssmm_bin: Option<PathBuf>,
+        /// Actually write the drop-in and run `systemctl daemon-reload`.
+        /// Without this flag the drop-in is printed to stdout.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Exec a command with SSM parameters injected as env vars (no .env on disk)
+    ///
+    /// Resolves parameters the same way as `sync` (app + shared overlay +
+    /// include-tag overlay), then replaces the current process with the given
+    /// command (execvp). Values never touch the filesystem. Parent environment
+    /// variables are inherited; SSM values overlay them.
+    Exec {
+        #[arg(long)]
+        app: Option<String>,
+        /// Skip /<prefix>/shared/* overlay (default: included)
+        #[arg(long)]
+        no_shared: bool,
+        /// Also include parameters matching tag (repeatable)
+        #[arg(long = "include-tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+        include_tags: Vec<String>,
+        /// Exit with non-zero status when any shared / tag key is overridden
+        /// by an app-level key (instead of just warning to stderr)
+        #[arg(long)]
+        strict: bool,
+        /// Command and arguments to exec (use `--` before the command so
+        /// flags destined for the child are not consumed by ssmm)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            num_args = 1..,
+            value_name = "CMD"
+        )]
+        cmd: Vec<String>,
+    },
     /// Migrate parameters from an old prefix to a new prefix
     Migrate {
         old_prefix: String,
@@ -340,6 +419,32 @@ async fn main() -> Result<()> {
             include_tags,
             strict,
         } => cmd_sync(&client, app, out, no_shared, include_tags, strict).await,
+        Command::Exec {
+            app,
+            no_shared,
+            include_tags,
+            strict,
+            cmd,
+        } => cmd_exec(&client, app, no_shared, include_tags, strict, cmd).await,
+        Command::MigrateToExec {
+            unit,
+            app,
+            exec_cmd,
+            system,
+            keep_env_files,
+            pre_execs,
+            ssmm_bin,
+            apply,
+        } => cmd_migrate_to_exec(
+            unit,
+            app,
+            exec_cmd,
+            system,
+            keep_env_files,
+            pre_execs,
+            ssmm_bin,
+            apply,
+        ),
         Command::Migrate {
             old_prefix,
             new_prefix,
@@ -1010,17 +1115,24 @@ async fn cmd_dirs(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_sync(
+/// sync と exec で共有する、app + shared + tag overlay を畳み込んだ環境マップ。
+struct MergedEnv {
+    map: BTreeMap<String, String>,
+    app_params_count: usize,
+    shared_params_count: usize,
+    tag_params_count: usize,
+}
+
+/// 優先度 app > include-tag > shared で SSM を畳み込み、env key → value に正規化する。
+/// `strict=true` のとき shared/app 衝突があれば bail、false のときは stderr 警告のみ。
+async fn build_env_map(
     client: &Client,
-    app: Option<String>,
-    out: PathBuf,
+    app: &str,
     no_shared: bool,
-    raw_include_tags: Vec<String>,
+    include_tags: &[(String, String)],
     strict: bool,
-) -> Result<()> {
-    let app = resolve_app(app)?;
-    let prefix = app_prefix(&app);
-    let include_tags = parse_tags(&raw_include_tags)?;
+) -> Result<MergedEnv> {
+    let prefix = app_prefix(app);
     let want_shared = !no_shared && app != "shared";
 
     // 3 本の SSM 問い合わせを並列化 (hot path)
@@ -1037,7 +1149,7 @@ async fn cmd_sync(
             if include_tags.is_empty() {
                 Ok(Vec::new())
             } else {
-                names_filtered_by_tags(client, &include_tags, Some(prefix_root())).await
+                names_filtered_by_tags(client, include_tags, Some(prefix_root())).await
             }
         }
     )?;
@@ -1056,10 +1168,10 @@ async fn cmd_sync(
 
     if app_params.is_empty() && shared_params.is_empty() && tag_params.is_empty() {
         bail!(
-            "no parameters for sync (prefix={}, shared={}, include-tags={:?})",
-            prefix,
+            "no parameters found (app={}, shared={}, include-tags={:?})",
+            app,
             want_shared,
-            raw_include_tags
+            include_tags
         );
     }
 
@@ -1103,14 +1215,32 @@ async fn cmd_sync(
             names.join(", ")
         );
         if strict {
-            bail!(
-                "sync aborted by --strict due to {} conflict(s)",
-                names.len()
-            );
+            bail!("aborted by --strict due to {} conflict(s)", names.len());
         }
     }
 
+    Ok(MergedEnv {
+        map: merged,
+        app_params_count: app_params.len(),
+        shared_params_count: shared_params.len(),
+        tag_params_count: tag_params.len(),
+    })
+}
+
+async fn cmd_sync(
+    client: &Client,
+    app: Option<String>,
+    out: PathBuf,
+    no_shared: bool,
+    raw_include_tags: Vec<String>,
+    strict: bool,
+) -> Result<()> {
+    let app = resolve_app(app)?;
+    let include_tags = parse_tags(&raw_include_tags)?;
+    let merged = build_env_map(client, &app, no_shared, &include_tags, strict).await?;
+
     let body: String = merged
+        .map
         .iter()
         .map(|(k, v)| format!("{}={}\n", k, v))
         .collect();
@@ -1119,10 +1249,10 @@ async fn cmd_sync(
     if existing.as_deref() == Some(body.as_str()) {
         println!(
             "ssmm: no change ({} variables; app={}, shared={}, tag={})",
-            merged.len(),
-            app_params.len(),
-            shared_params.len(),
-            tag_params.len()
+            merged.map.len(),
+            merged.app_params_count,
+            merged.shared_params_count,
+            merged.tag_params_count
         );
         return Ok(());
     }
@@ -1133,13 +1263,225 @@ async fn cmd_sync(
     std::fs::rename(&tmp, &out)?;
     println!(
         "ssmm: wrote {} variables to {} (app={}, shared={}, tag={})",
-        merged.len(),
+        merged.map.len(),
         out.display(),
-        app_params.len(),
-        shared_params.len(),
-        tag_params.len()
+        merged.app_params_count,
+        merged.shared_params_count,
+        merged.tag_params_count
     );
     Ok(())
+}
+
+enum SystemdScope {
+    User,
+    System,
+}
+
+impl SystemdScope {
+    fn as_cli_flag(&self) -> &'static str {
+        match self {
+            Self::User => "--user",
+            Self::System => "--system",
+        }
+    }
+
+    fn drop_in_dir(&self, unit: &str) -> Result<PathBuf> {
+        if !unit.ends_with(".service") {
+            bail!("unit must end with .service: got {:?}", unit);
+        }
+        match self {
+            Self::User => {
+                let home = std::env::var("HOME").context("HOME env not set")?;
+                Ok(PathBuf::from(home)
+                    .join(".config/systemd/user")
+                    .join(format!("{}.d", unit)))
+            }
+            Self::System => Ok(PathBuf::from("/etc/systemd/system").join(format!("{}.d", unit))),
+        }
+    }
+}
+
+/// systemd drop-in として投入可能な `[Service]` セクションを組み立てる。
+/// - `EnvironmentFile=` と `ExecStartPre=` は空行で一度 reset してから再指定する
+///   (drop-in の list-accumulate を避けるため)。
+/// - `ExecStart=` の値は `<ssmm> exec --app <app> -- <exec_cmd>` の生文字列。
+///   systemd は ExecStart= を空白区切りで引数にする。`exec_cmd` 側に引用符や
+///   エスケープが必要なら呼び出し側の責任で渡す。
+fn build_drop_in(
+    app: &str,
+    exec_cmd: &str,
+    keep_env_files: &[PathBuf],
+    pre_execs: &[String],
+    ssmm_bin: &Path,
+    prefix_root: &str,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# Generated by `ssmm migrate-to-exec` (ssmm {}).",
+        env!("CARGO_PKG_VERSION")
+    );
+    let _ = writeln!(
+        out,
+        "# Revert: rm this file, then `systemctl [--user|--system] daemon-reload`."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "[Service]");
+    // SSM 由来の .env を読ませないため EnvironmentFile= を reset。
+    // keep 指定があれば再追加 (`-` prefix でファイル欠如を許容)。
+    let _ = writeln!(out, "EnvironmentFile=");
+    for p in keep_env_files {
+        let _ = writeln!(out, "EnvironmentFile=-{}", p.display());
+    }
+    // ExecStartPre= を reset してから指定分を再追加。
+    let _ = writeln!(out, "ExecStartPre=");
+    for cmd in pre_execs {
+        let _ = writeln!(out, "ExecStartPre={}", cmd);
+    }
+    // ExecStart= を ssmm exec 経由に差し替え。
+    let _ = writeln!(out, "ExecStart=");
+    let _ = writeln!(
+        out,
+        "ExecStart={} exec --app {} -- {}",
+        ssmm_bin.display(),
+        app,
+        exec_cmd
+    );
+    // ssmm が prefix を解決できるように環境変数を注入。
+    let _ = writeln!(out, "Environment=SSMM_PREFIX_ROOT={}", prefix_root);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_migrate_to_exec(
+    unit: String,
+    app: String,
+    exec_cmd: String,
+    system: bool,
+    keep_env_files: Vec<PathBuf>,
+    pre_execs: Vec<String>,
+    ssmm_bin: Option<PathBuf>,
+    apply: bool,
+) -> Result<()> {
+    let scope = if system {
+        SystemdScope::System
+    } else {
+        SystemdScope::User
+    };
+
+    let ssmm_bin = ssmm_bin
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".cargo/bin/ssmm"))
+        })
+        .ok_or_else(|| anyhow!("cannot resolve default ssmm bin path (HOME unset)"))?;
+    if !ssmm_bin.is_absolute() {
+        bail!("--ssmm-bin must be an absolute path: {:?}", ssmm_bin);
+    }
+
+    let drop_in_dir = scope.drop_in_dir(&unit)?;
+    let drop_in_path = drop_in_dir.join("exec-mode.conf");
+
+    let content = build_drop_in(
+        &app,
+        &exec_cmd,
+        &keep_env_files,
+        &pre_execs,
+        &ssmm_bin,
+        prefix_root(),
+    );
+
+    if !apply {
+        println!(
+            "# dry-run: would write {}",
+            drop_in_path.display().to_string().bold()
+        );
+        println!(
+            "# apply with: `ssmm migrate-to-exec ... --apply`  (writes file + daemon-reload)"
+        );
+        println!(
+            "# revert with: `rm {} && systemctl {} daemon-reload`",
+            drop_in_path.display(),
+            scope.as_cli_flag()
+        );
+        println!();
+        print!("{}", content);
+        return Ok(());
+    }
+
+    if drop_in_path.exists() {
+        eprintln!(
+            "  {} {} already exists; overwriting",
+            "warning:".yellow().bold(),
+            drop_in_path.display()
+        );
+    }
+
+    std::fs::create_dir_all(&drop_in_dir)
+        .with_context(|| format!("mkdir -p {}", drop_in_dir.display()))?;
+    std::fs::write(&drop_in_path, &content)
+        .with_context(|| format!("write {}", drop_in_path.display()))?;
+    println!("  ✓ wrote {}", drop_in_path.display());
+
+    let status = std::process::Command::new("systemctl")
+        .arg(scope.as_cli_flag())
+        .arg("daemon-reload")
+        .status()
+        .context("spawn systemctl daemon-reload")?;
+    if !status.success() {
+        bail!(
+            "`systemctl {} daemon-reload` exited with {}",
+            scope.as_cli_flag(),
+            status
+        );
+    }
+    println!("  ✓ systemctl {} daemon-reload", scope.as_cli_flag());
+
+    println!();
+    println!(
+        "revert: rm {} && systemctl {} daemon-reload",
+        drop_in_path.display(),
+        scope.as_cli_flag()
+    );
+
+    Ok(())
+}
+
+async fn cmd_exec(
+    client: &Client,
+    app: Option<String>,
+    no_shared: bool,
+    raw_include_tags: Vec<String>,
+    strict: bool,
+    cmd_and_args: Vec<String>,
+) -> Result<()> {
+    let app = resolve_app(app)?;
+    let include_tags = parse_tags(&raw_include_tags)?;
+    let merged = build_env_map(client, &app, no_shared, &include_tags, strict).await?;
+
+    // clap の `required = true, num_args = 1..` で保証されるため、空なら設計バグ
+    let (program, args) = cmd_and_args
+        .split_first()
+        .expect("clap enforces at least one CMD argument");
+
+    eprintln!(
+        "ssmm: exec {} with {} variables (app={}, shared={}, tag={})",
+        program,
+        merged.map.len(),
+        merged.app_params_count,
+        merged.shared_params_count,
+        merged.tag_params_count
+    );
+
+    use std::os::unix::process::CommandExt;
+    // exec() 成功時は制御が戻らない (プロセス置換)。失敗時のみ io::Error が返る。
+    // 値流出を避けるため、エラー整形は program 名のみ含める (env 値は絶対に出さない)
+    let err = std::process::Command::new(program)
+        .args(args)
+        .envs(&merged.map)
+        .exec();
+    Err(anyhow!("exec {}: {}", program, err))
 }
 
 async fn cmd_migrate(
@@ -1591,6 +1933,87 @@ mod tests {
                 ("KEY3".to_string(), "single".to_string()),
                 ("KEY4".to_string(), "trimmed".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn build_drop_in_minimal_no_keeps_no_pres() {
+        let out = build_drop_in(
+            "myapp",
+            "/usr/bin/echo hi",
+            &[],
+            &[],
+            Path::new("/home/me/.cargo/bin/ssmm"),
+            "/myteam",
+        );
+        // reset 行が単独で存在し、再指定なしで下に進む
+        assert!(
+            out.contains("\nEnvironmentFile=\nExecStartPre="),
+            "EnvironmentFile= reset without re-add should be immediately followed by \
+             ExecStartPre= reset, got:\n{out}"
+        );
+        assert!(
+            out.contains("\nExecStartPre=\nExecStart="),
+            "ExecStartPre= reset should be immediately followed by ExecStart= reset"
+        );
+        // ExecStart の最終行
+        assert!(out.contains(
+            "\nExecStart=/home/me/.cargo/bin/ssmm exec --app myapp -- /usr/bin/echo hi\n"
+        ));
+        assert!(out.contains("Environment=SSMM_PREFIX_ROOT=/myteam"));
+    }
+
+    #[test]
+    fn build_drop_in_with_keeps_and_pres() {
+        let out = build_drop_in(
+            "billing-api",
+            "/usr/bin/uv run python app.py --mode prod",
+            &[
+                PathBuf::from("/home/you/.config/sdtab/env"),
+                PathBuf::from("/etc/defaults/billing"),
+            ],
+            &[
+                "/usr/bin/playwright install chromium".to_string(),
+                "/bin/mkdir -p /var/run/billing".to_string(),
+            ],
+            Path::new("/usr/local/bin/ssmm"),
+            "/myteam",
+        );
+        assert!(out.contains("EnvironmentFile=-/home/you/.config/sdtab/env\n"));
+        assert!(out.contains("EnvironmentFile=-/etc/defaults/billing\n"));
+        assert!(out.contains("ExecStartPre=/usr/bin/playwright install chromium\n"));
+        assert!(out.contains("ExecStartPre=/bin/mkdir -p /var/run/billing\n"));
+        assert!(out.contains(
+            "ExecStart=/usr/local/bin/ssmm exec --app billing-api -- \
+             /usr/bin/uv run python app.py --mode prod\n"
+        ));
+    }
+
+    #[test]
+    fn build_drop_in_preserves_reset_order() {
+        // drop-in の規則: list-reset (空の `KEY=`) は必ず追加指定の「前」に来る。
+        // 順序が逆だと systemd は追加指定を破棄してしまう。
+        let out = build_drop_in(
+            "app",
+            "/bin/true",
+            &[PathBuf::from("/tmp/keep")],
+            &["/bin/pre".to_string()],
+            Path::new("/ssmm"),
+            "/root",
+        );
+        let reset_env = out.find("\nEnvironmentFile=\n").expect("has env reset");
+        let keep_env = out
+            .find("EnvironmentFile=-/tmp/keep\n")
+            .expect("has env keep");
+        assert!(
+            reset_env < keep_env,
+            "EnvironmentFile= reset must precede keep line"
+        );
+        let reset_pre = out.find("\nExecStartPre=\n").expect("has pre reset");
+        let add_pre = out.find("ExecStartPre=/bin/pre\n").expect("has pre add");
+        assert!(
+            reset_pre < add_pre,
+            "ExecStartPre= reset must precede add line"
         );
     }
 

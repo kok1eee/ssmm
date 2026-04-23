@@ -1,15 +1,15 @@
 ---
 name: ssmm
-description: AWS SSM Parameter Store を .env ファイル同期の source of truth にする OSS ワークフロー。systemd の EnvironmentFile= と組み合わせて平文 .env を脱却する時、team-scoped prefix (/<team>/<app>/<key>) で横断管理したい時、.env を安全に再生成 / 移行したい時に使う。Rust CLI `ssmm` (crates.io) が必要。
+description: AWS SSM Parameter Store を source of truth にして平文 .env を脱却する OSS ワークフロー。`sync` モード (systemd の EnvironmentFile= 用に mode 0600 の .env を再生成) と `exec` モード (プロセス環境変数に直注入、ディスクに .env を残さない、chamber 互換) の 2 方式を提供。`migrate-to-exec` で既存 sync unit を drop-in 生成で一括 exec 化可能。team-scoped prefix (/<team>/<app>/<key>) で横断管理、SecureString / String 自動判定、shared / tag overlay、prefix 移行に使う。Rust CLI `ssmm` (crates.io) が必要。
 ---
 
 Base directory for this skill: <cloned repo>/.claude/skills/ssmm
 
-# ssmm: SSM-backed `.env` sync workflow
+# ssmm: SSM-backed `.env` workflow (sync or exec)
 
 このプロジェクト付属 skill。`ssmm` CLI の使い方と、typical な
-`put → sync → systemd` フローを示す。チーム内部固有の運用ルールは
-含まない generic 版。
+`put → (sync | exec) → systemd` フローを示す。チーム内部固有の運用
+ルールは含まない generic 版。
 
 ## いつ使うか
 
@@ -20,18 +20,24 @@ Base directory for this skill: <cloned repo>/.claude/skills/ssmm
 - 複数アプリ間の重複キー / 重複値を棚卸ししたい
 - SecureString で保存すべき key が誤って String で投入されていないか
   チェックしたい
+- ディスクに平文 `.env` を一切残したくない (`exec` モード)
 
 ## ゴール
 
 ```
 <project>/.env (平文、ディスク常駐、git commit 事故のリスク)
         ↓
-SSM Parameter Store /<team>/<app>/*  を source of truth にし、
-systemd 起動時に ssmm sync が .env (mode 0600) を再生成する運用
+SSM Parameter Store /<team>/<app>/* を source of truth にし、2 方式のいずれかで配信:
+
+  (A) ssmm sync   → systemd の EnvironmentFile= 用に .env (mode 0600) を再生成
+                    既存アプリ無改修、単体コマンドでも手動確認しやすい
+  (B) ssmm exec   → プロセス環境変数に直注入して execvp、.env ファイル不要
+                    ディスクに平文を残さない chamber 互換モード
 ```
 
-`.env` は実行時産物。git/ディスクに永続的な秘密情報を残さない。
-トレードオフの詳細は README の **Security model** section 参照。
+どちらを選ぶかは脅威モデル次第 (README の **Security model** section
+参照)。同じ prefix 規約 / SecureString 判定 / shared + tag overlay を
+共有するため、後からもう一方に切り替えても SSM 側のデータはそのまま。
 
 ## 前提
 
@@ -112,6 +118,10 @@ ssmm list --keys-only
 
 ### 3. systemd に接続
 
+脅威モデルで `sync` か `exec` を選ぶ。両方とも SSM 側のデータは同じ。
+
+#### 3A. sync モード (.env を mode 0600 で再生成)
+
 新規 wrapper:
 
 ```bash
@@ -134,13 +144,64 @@ EnvironmentFile=/opt/app/.env
 ExecStart=/opt/app/run.sh
 ```
 
+#### 3B. exec モード (ディスクに .env を残さない)
+
+ExecStart 自体を `ssmm exec` 経由に。execvp でプロセス置換するので、
+systemd から見ると直接アプリが起動したのと同じ (MainPID / signals /
+journal output そのまま機能):
+
+```ini
+[Service]
+Environment=SSMM_PREFIX_ROOT=/<your-team>
+ExecStart=/home/<user>/.cargo/bin/ssmm exec --app <a> --strict -- /opt/app/run.sh
+# 子に渡す引数は `--` より後ろに。`-H` `--port` など子フラグは ssmm に吸われない
+```
+
+`EnvironmentFile=` は**書かない**。SSM 値はプロセス environ に直注入
+される。親プロセス (systemd) から継承した env 変数も残るので、
+`SSMM_PREFIX_ROOT` は `Environment=` で渡す。
+
+#### 3C. sync → exec への移行自動化 (`ssmm migrate-to-exec`, v0.5.0+)
+
+既存の sync モード unit を exec モードに切り替える drop-in を自動生成:
+
+```bash
+# dry-run: 提案 drop-in を stdout に出すだけ
+ssmm migrate-to-exec \
+  --unit <unit>.service \
+  --app <ssm-app> \
+  --exec-cmd "<現行 ExecStart= の値をそのまま貼る>" \
+  --keep-env-file /<team 共通 env のパス> \
+  --pre-exec "<残したい ExecStartPre をコマンド単位で列挙>"
+
+# 確定: drop-in を書き込み + daemon-reload
+ssmm migrate-to-exec ... --apply
+```
+
+- **`--exec-cmd` は必須**: `systemctl cat <unit>` を見て `ExecStart=` の
+  右辺をそのまま `--exec-cmd "..."` に貼る。systemd の show/cat 出力は
+  version 差があって parse が fragile なので、ssmm は自動解析しない。
+- `--keep-env-file` は **SSM 非由来**の `EnvironmentFile=` を保持する
+  (sdtab 共通 env など)。指定しないと全 EnvironmentFile= が外れる。
+- `--pre-exec` は空白区切りコマンド。複数回指定で順序付き列挙。
+  元の `ExecStartPre=` に `ssmm sync` 以外の前処理 (playwright install,
+  キャッシュ warm 等) が混ざっていた場合、そちらだけ残す。
+- **revert は 1 行**: `rm <drop-in> && systemctl --user daemon-reload`。
+- sdtab 管理下の unit でも動作確認済 (drop-in が共存する)。ただし
+  `sdtab upgrade` が走ったとき `exec-mode.conf` が温存されるかは
+  バージョン依存なので、初回移行後 1 度 `sdtab upgrade` を走らせて
+  survives するか軽く確認しておくと安心。
+
 ### 4. 動作確認
 
 ```bash
 systemctl --user start --no-block <service>
 journalctl --user -u <service> --no-pager --since "1 minute ago" -n 20
+# (sync モード)
 #   ssmm: no change (N variables; ...)    ← 既存 .env と一致
 #   ssmm: wrote N variables to ...        ← 初回 or SSM 変更あり
+# (exec モード)
+#   ssmm: exec /opt/app/run.sh with N variables (app=N, shared=0, tag=0)
 ```
 
 `--strict` を付けておくと、shared / tag overlay の衝突が起きた時に
