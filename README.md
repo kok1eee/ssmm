@@ -12,11 +12,11 @@ enough to remove a lot of shell-script boilerplate.
 
 ## Why another SSM wrapper?
 
-Existing tools (e.g. [chamber](https://github.com/segmentio/chamber)) inject
-secrets as env vars at `exec` time. `ssmm` instead **materializes a `.env`
-file** on disk (mode 0600) that systemd loads via `EnvironmentFile=`. That
-makes it a drop-in replacement for plaintext `.env` in existing systemd-based
-deployments without changing the apps themselves.
+`ssmm` **materializes a `.env` file** on disk (mode 0600) that systemd
+loads via `EnvironmentFile=`. That makes it a drop-in replacement for
+plaintext `.env` in existing systemd-based deployments without changing
+the apps themselves. See [Security model](#security-model) for the
+disk-materialization tradeoff.
 
 Other opinions baked in:
 
@@ -145,31 +145,77 @@ Override with `--app <name>` any time.
 
 ## Concurrency and throttling
 
-SSM's `PutParameter` has a low per-account TPS (~3/s for standard parameters).
-`ssmm` caps concurrent writes to 3 and uses AWS SDK adaptive retry
-(`max_attempts=10`), so a 300-parameter bulk import completes without manual
-backoff.
+SSM's `PutParameter` has a low per-account TPS (~3/s for standard
+parameters). `ssmm` defaults to `--write-concurrency=3` with AWS SDK
+adaptive retry (`max_attempts=10`), so bulk imports complete without
+manual backoff. Reads default to `--read-concurrency=10`. Both are
+adjustable per invocation:
 
-## Comparison
+```bash
+ssmm --write-concurrency 1 put --env .env     # tighter throttle-avoidance
+ssmm --read-concurrency 20 list --all          # faster on high-limit accounts
+```
 
-|                         | ssmm       | chamber | dotenv-vault |
-|-------------------------|------------|---------|--------------|
-| Backend                 | AWS SSM PS | AWS SSM PS / S3 | hosted |
-| Output model            | `.env` file | env vars at exec | `.env.vault` file |
-| systemd `EnvironmentFile` | ✅ native | needs `chamber exec` | no |
-| **Secrets materialized on disk** | **⚠️ yes (mode 0600)** | **no** (exec injection) | encrypted at rest |
-| Key namespace convention | `<team>/<app>/<key>` | `<service>/<key>` | env profile |
-| Tag management          | ✅ (`tag add/remove/list`) | — | — |
-| Cross-app shared values | `/shared/` + tag overlay | — | — |
-| Language                | Rust | Go | Node.js |
+## Security model
 
-> **Security tradeoff**: `ssmm sync` writes decrypted SecureString values
-> to a local file (mode 0600). This is a drop-in for plaintext `.env`
-> workflows, not a hardened secret manager. If your threat model includes
-> host compromise or backup exfiltration, prefer `chamber exec`-style
-> injection (values live only in process memory). `ssmm` buys you systemd
-> `EnvironmentFile=` compatibility and central SSM management at the cost
-> of plaintext-on-disk during process lifetime.
+`ssmm` is **not a hardened secret manager**. It's a `.env`-compatible
+convenience layer over SSM. Decide based on your threat model.
+
+### What `ssmm sync` actually does
+
+`ssmm sync` calls `GetParametersByPath` with `--with-decryption`, writes
+the resulting `KEY=VALUE` lines to the output path, and `chmod 0600`s
+the file. Decrypted SecureString values live:
+
+1. In memory on the host running `ssmm sync`
+2. In the on-disk file (mode 0600, owner-only readable)
+3. In the target process's environment after `systemd` reads
+   `EnvironmentFile=` (→ readable via `/proc/<pid>/environ` to the same
+   UID / root)
+
+### What this protects against
+
+- Accidental commit of plaintext `.env` to git (SSM is the source of truth)
+- Unauthorized teammates who have SSM read permission but not host login
+- Drift between hosts (central management vs hand-copied `.env` files)
+
+### What this does NOT protect against
+
+- **Host compromise**: attacker with filesystem read on the host sees
+  plaintext `.env` and the process environment
+- **Backup exfiltration**: if you back up `/opt/myapp/` or `/home/<user>/`,
+  plaintext secrets may end up in your backup storage
+- **Same-host other processes under the same UID**: `/proc/<pid>/environ`
+  is readable by same-UID processes
+
+### If your threat model is stricter
+
+Consider tools that never materialize decrypted values on disk:
+
+- **[chamber](https://github.com/segmentio/chamber)** (Segment) — reads
+  SSM at `exec` time and injects env vars; nothing on disk
+- **[aws-vault](https://github.com/99designs/aws-vault)** — similar
+  approach for AWS credentials
+- **SOPS + age/KMS** — encrypted-at-rest files, decrypt-on-read
+
+`ssmm`'s niche is specifically *systemd `EnvironmentFile=` drop-in
+replacement for plaintext `.env`*. If you don't need that integration,
+the tools above may fit your threat model better.
+
+## Similar tools
+
+I haven't benchmarked against the following in detail, so treat this
+as orientation, not authoritative comparison. Issues / PRs welcome if
+my positioning is wrong:
+
+- **chamber** — exec-time env var injection, no on-disk file
+- **aws-vault** — AWS credential focus, related design
+- **dotenv-vault** — hosted `.env.vault` format
+
+`ssmm`'s opinionated pieces (team-scoped prefix, flat-key convention,
+tag overlays, shared namespace, CWD auto-detection) exist to remove
+per-project shell boilerplate in systemd-heavy deployments. For other
+deployment shapes the above may be a better fit.
 
 ## License
 

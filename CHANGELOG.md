@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-23
+
+### Added
+
+- Global `--write-concurrency N` / `--read-concurrency N` flags to tune
+  bulk operations against AWS account-wide SSM TPS limits
+  (default: 3 writes / 10 reads)
+- `put --secure KEY` and `put --plain-key KEY` for per-key override of
+  the SecureString heuristic (repeatable). `put` output now displays the
+  classification reason: `auto: default` / `auto: suffix` /
+  `forced: --secure` / `forced: --plain-key` / `forced: --plain-all`
+- `sync --strict` exits non-zero when any shared / tag parameter is
+  overridden by an app-level parameter (systemd services can detect
+  the conflict as a failure instead of burying it in journalctl)
+- `migrate --delete-old` now writes a JSON backup to
+  `/tmp/ssmm-migrate-backup-<timestamp>.json` (mode 0600) and requires
+  `--confirm` to actually delete source parameters. Without `--confirm`
+  the command is a dry-run. SSM Parameter Store has no soft-delete, so
+  this backup is the only recovery path if a migration is wrong
+
+### Changed (breaking)
+
+- `put --plain` (boolean, force all to String) renamed to
+  `put --plain-all` to disambiguate from `--plain-key` (per-key override)
+- `migrate --delete-old` alone no longer deletes; `--delete-old --confirm`
+  is now required for the actual delete step
+
+### Docs
+
+- **Security model** independent section added to README, covering what
+  `.env` materialization protects against vs doesn't (host compromise,
+  backup exfiltration, `/proc/<pid>/environ` exposure) and pointers to
+  chamber / aws-vault / SOPS for stricter threat models
+- Removed the feature-comparison table. Replaced with a short
+  "Similar tools" pointer noting chamber / aws-vault / dotenv-vault
+  without claiming details I hadn't verified directly
+
+### Dependencies
+
+- `serde` + `serde_json` for `migrate --delete-old` backup JSON dump
+
 ## [0.1.1] - 2026-04-23
 
 ### Fixed

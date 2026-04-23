@@ -6,6 +6,7 @@ use aws_sdk_ssm::types::{
 use clap::{ArgAction, Parser, Subcommand};
 use colored::Colorize;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
@@ -17,13 +18,15 @@ const DEFAULT_PREFIX_ROOT: &str = "/amu-revo";
 const DEFAULT_SHARED_PREFIX: &str = "/amu-revo/shared";
 const SSMM_ENV_VAR: &str = "SSMM_PREFIX_ROOT";
 
-/// SSM PutParameter の TPS (~3) に合わせて書き込み並列度を制限。
-/// read 系 (GetParameters 等) は余裕があるので大きめ。
-const WRITE_CONCURRENCY: usize = 3;
-const READ_CONCURRENCY: usize = 10;
+/// SSM PutParameter の TPS (~3) に合わせたデフォルト書き込み並列度。
+/// `--write-concurrency N` で上書き可。read 系はより高くても安全。
+const DEFAULT_WRITE_CONCURRENCY: usize = 3;
+const DEFAULT_READ_CONCURRENCY: usize = 10;
 
 static PREFIX_ROOT: OnceLock<String> = OnceLock::new();
 static SHARED_PREFIX: OnceLock<String> = OnceLock::new();
+static WRITE_CONCURRENCY: OnceLock<usize> = OnceLock::new();
+static READ_CONCURRENCY: OnceLock<usize> = OnceLock::new();
 
 fn prefix_root() -> &'static str {
     PREFIX_ROOT
@@ -37,6 +40,20 @@ fn shared_prefix() -> &'static str {
         .get()
         .map(String::as_str)
         .unwrap_or(DEFAULT_SHARED_PREFIX)
+}
+
+fn write_concurrency() -> usize {
+    WRITE_CONCURRENCY
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_WRITE_CONCURRENCY)
+}
+
+fn read_concurrency() -> usize {
+    READ_CONCURRENCY
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_READ_CONCURRENCY)
 }
 
 async fn run_bounded<F, Fut, T>(futs: F, limit: usize) -> Result<Vec<T>>
@@ -61,6 +78,16 @@ struct Cli {
     /// (default: /amu-revo; override via $SSMM_PREFIX_ROOT env var)
     #[arg(long, global = true)]
     prefix: Option<String>,
+
+    /// Max concurrent SSM writes (PutParameter / DeleteParameters /
+    /// AddTagsToResource). Default: 3 (matches standard-parameter TPS).
+    #[arg(long, global = true, value_name = "N")]
+    write_concurrency: Option<usize>,
+
+    /// Max concurrent SSM reads (GetParameters / DescribeParameters).
+    /// Default: 10.
+    #[arg(long, global = true, value_name = "N")]
+    read_concurrency: Option<usize>,
 
     #[command(subcommand)]
     command: Command,
@@ -91,9 +118,15 @@ enum Command {
         env: Option<PathBuf>,
         #[arg(long)]
         app: Option<String>,
-        /// Force all values to be stored as String (no SecureString auto-detect)
+        /// Force ALL values to String (ignores per-key overrides and heuristic)
         #[arg(long)]
-        plain: bool,
+        plain_all: bool,
+        /// Force specific keys to String (repeatable: --plain-key LOG_DIR --plain-key DB_HOST)
+        #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
+        plain_keys: Vec<String>,
+        /// Force specific keys to SecureString (repeatable: --secure DATABASE_URL)
+        #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
+        secure_keys: Vec<String>,
         /// Extra tags (repeatable: --tag env=prod --tag owner=backend)
         /// `app` tag is always attached automatically.
         #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
@@ -129,13 +162,24 @@ enum Command {
         /// Also include parameters matching tag (repeatable)
         #[arg(long = "include-tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
         include_tags: Vec<String>,
+        /// Exit with non-zero status when any shared / tag key is overridden
+        /// by an app-level key (instead of just warning to stderr)
+        #[arg(long)]
+        strict: bool,
     },
     /// Migrate parameters from an old prefix to a new prefix
     Migrate {
         old_prefix: String,
         new_prefix: String,
+        /// Delete source parameters after copy. Requires --confirm to actually
+        /// delete; without --confirm the command only dumps a backup and
+        /// reports what WOULD be deleted (safe default).
         #[arg(long)]
         delete_old: bool,
+        /// Actually perform the delete step of --delete-old. A JSON backup is
+        /// written to /tmp/ssmm-migrate-backup-<timestamp>.json in either case.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Check for duplicate keys or identical values across apps
     Check {
@@ -203,6 +247,18 @@ async fn main() -> Result<()> {
     SHARED_PREFIX
         .set(shared)
         .expect("SHARED_PREFIX should only be set once during startup");
+    if let Some(n) = cli.write_concurrency {
+        if n == 0 {
+            bail!("--write-concurrency must be >= 1");
+        }
+        WRITE_CONCURRENCY.set(n).ok();
+    }
+    if let Some(n) = cli.read_concurrency {
+        if n == 0 {
+            bail!("--read-concurrency must be >= 1");
+        }
+        READ_CONCURRENCY.set(n).ok();
+    }
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .retry_config(aws_config::retry::RetryConfig::adaptive().with_max_attempts(10))
@@ -221,9 +277,23 @@ async fn main() -> Result<()> {
             pairs,
             env,
             app,
-            plain,
+            plain_all,
+            plain_keys,
+            secure_keys,
             tags,
-        } => cmd_put(&client, pairs, env, app, plain, tags).await,
+        } => {
+            cmd_put(
+                &client,
+                pairs,
+                env,
+                app,
+                plain_all,
+                plain_keys,
+                secure_keys,
+                tags,
+            )
+            .await
+        }
         Command::Delete {
             target,
             app,
@@ -237,12 +307,14 @@ async fn main() -> Result<()> {
             out,
             no_shared,
             include_tags,
-        } => cmd_sync(&client, app, out, no_shared, include_tags).await,
+            strict,
+        } => cmd_sync(&client, app, out, no_shared, include_tags, strict).await,
         Command::Migrate {
             old_prefix,
             new_prefix,
             delete_old,
-        } => cmd_migrate(&client, old_prefix, new_prefix, delete_old).await,
+            confirm,
+        } => cmd_migrate(&client, old_prefix, new_prefix, delete_old, confirm).await,
         Command::Check {
             duplicates,
             values,
@@ -489,7 +561,7 @@ async fn get_parameters_by_names(client: &Client, names: &[String]) -> Result<Ve
                 .context("get_parameters")
         }
     });
-    let results = run_bounded(futs, READ_CONCURRENCY).await?;
+    let results = run_bounded(futs, read_concurrency()).await?;
     Ok(results
         .into_iter()
         .flat_map(|r| r.parameters.unwrap_or_default())
@@ -511,7 +583,7 @@ async fn delete_parameters_batched(client: &Client, names: &[String]) -> Result<
                 .context("delete_parameters")
         }
     });
-    let results = run_bounded(futs, WRITE_CONCURRENCY).await?;
+    let results = run_bounded(futs, write_concurrency()).await?;
     Ok(results
         .into_iter()
         .flat_map(|r| r.deleted_parameters.unwrap_or_default())
@@ -612,12 +684,59 @@ async fn cmd_list(
     Ok(())
 }
 
+/// put 時の型判定の根拠を出力用に記録する
+#[derive(Clone, Copy)]
+enum TypeReason {
+    ForcedPlainAll,
+    ForcedPlainKey,
+    ForcedSecureKey,
+    AutoSuffix,
+    AutoDefault,
+}
+
+impl TypeReason {
+    fn label(self) -> &'static str {
+        match self {
+            TypeReason::ForcedPlainAll => "forced: --plain-all",
+            TypeReason::ForcedPlainKey => "forced: --plain-key",
+            TypeReason::ForcedSecureKey => "forced: --secure",
+            TypeReason::AutoSuffix => "auto: suffix",
+            TypeReason::AutoDefault => "auto: default",
+        }
+    }
+}
+
+fn resolve_type(
+    key: &str,
+    plain_all: bool,
+    plain_keys: &HashSet<String>,
+    secure_keys: &HashSet<String>,
+) -> (ParameterType, TypeReason) {
+    if plain_all {
+        return (ParameterType::String, TypeReason::ForcedPlainAll);
+    }
+    if secure_keys.contains(key) {
+        return (ParameterType::SecureString, TypeReason::ForcedSecureKey);
+    }
+    if plain_keys.contains(key) {
+        return (ParameterType::String, TypeReason::ForcedPlainKey);
+    }
+    if should_be_secure(key) {
+        (ParameterType::SecureString, TypeReason::AutoDefault)
+    } else {
+        (ParameterType::String, TypeReason::AutoSuffix)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_put(
     client: &Client,
     pairs: Vec<String>,
     env: Option<PathBuf>,
     app: Option<String>,
-    plain: bool,
+    plain_all: bool,
+    plain_keys: Vec<String>,
+    secure_keys: Vec<String>,
     raw_tags: Vec<String>,
 ) -> Result<()> {
     let app = resolve_app(app)?;
@@ -630,7 +749,6 @@ async fn cmd_put(
     } else {
         bail!("either --env <file> or KEY=VALUE arguments are required");
     };
-    // SSM は空文字列を許容しない。空値は skip して警告
     let before = kvs.len();
     kvs.retain(|(k, v)| {
         if v.is_empty() {
@@ -654,6 +772,15 @@ async fn cmd_put(
         bail!("no key=value to put");
     }
 
+    let plain_set: HashSet<String> = plain_keys.into_iter().collect();
+    let secure_set: HashSet<String> = secure_keys.into_iter().collect();
+    if let Some(conflict) = plain_set.intersection(&secure_set).next() {
+        bail!(
+            "key {:?} is listed in both --plain-key and --secure; pick one",
+            conflict
+        );
+    }
+
     let extra_tags = parse_tags(&raw_tags)?;
     if extra_tags.iter().any(|(k, _)| k == "app") {
         bail!("`app` tag is reserved; do not pass --tag app=...");
@@ -667,11 +794,7 @@ async fn cmd_put(
 
     let futs = kvs.iter().map(|(k, v)| {
         let name = format!("{}/{}", prefix, env_key_to_ssm_tail(k));
-        let ptype = if plain || !should_be_secure(k) {
-            ParameterType::String
-        } else {
-            ParameterType::SecureString
-        };
+        let (ptype, reason) = resolve_type(k, plain_all, &plain_set, &secure_set);
         let tags = all_tags.clone();
         let key = k.clone();
         let value = v.clone();
@@ -703,10 +826,10 @@ async fn cmd_put(
                 );
             }
 
-            Ok::<_, anyhow::Error>((name, ptype, key, value.len()))
+            Ok::<_, anyhow::Error>((name, ptype, reason, key, value.len()))
         }
     });
-    let results = run_bounded(futs, WRITE_CONCURRENCY).await?;
+    let results = run_bounded(futs, write_concurrency()).await?;
 
     let tag_note = if extra_tags.is_empty() {
         String::new()
@@ -720,12 +843,19 @@ async fn cmd_put(
                 .join(",")
         )
     };
-    for (name, ptype, _key, len) in results {
+    for (name, ptype, reason, _key, len) in results {
         let type_label = match ptype {
             ParameterType::SecureString => "SecureString".yellow(),
             _ => "String".green(),
         };
-        println!("  ✓ {} ({}, len={}){}", name, type_label, len, tag_note);
+        println!(
+            "  ✓ {} ({} [{}], len={}){}",
+            name,
+            type_label,
+            reason.label().dimmed(),
+            len,
+            tag_note
+        );
     }
     Ok(())
 }
@@ -849,6 +979,7 @@ async fn cmd_sync(
     out: PathBuf,
     no_shared: bool,
     raw_include_tags: Vec<String>,
+    strict: bool,
 ) -> Result<()> {
     let app = resolve_app(app)?;
     let prefix = app_prefix(&app);
@@ -923,12 +1054,23 @@ async fn cmd_sync(
     if !conflicts.is_empty() {
         let mut names: Vec<&str> = conflicts.iter().map(|s| s.as_str()).collect();
         names.sort();
+        let label = if strict {
+            "error:".red().bold()
+        } else {
+            "warning:".yellow().bold()
+        };
         eprintln!(
             "{} {} shared key(s) overridden by app: {}",
-            "warning:".yellow().bold(),
+            label,
             names.len(),
             names.join(", ")
         );
+        if strict {
+            bail!(
+                "sync aborted by --strict due to {} conflict(s)",
+                names.len()
+            );
+        }
     }
 
     let body: String = merged
@@ -968,6 +1110,7 @@ async fn cmd_migrate(
     old_prefix: String,
     new_prefix: String,
     delete_old: bool,
+    confirm: bool,
 ) -> Result<()> {
     let params = get_parameters_by_path(client, &old_prefix).await?;
     if params.is_empty() {
@@ -979,6 +1122,45 @@ async fn cmd_migrate(
         old_prefix.bold(),
         new_prefix.bold()
     );
+
+    // --delete-old 指定時は、実削除の有無にかかわらず bak dump を先に書く。
+    // SSM Parameter Store は soft-delete が無いため、消した後は復旧 API が
+    // 存在しない。JSON dump があれば手動復元の手がかりになる。
+    let backup_path: Option<PathBuf> = if delete_old {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = PathBuf::from(format!("/tmp/ssmm-migrate-backup-{}.json", ts));
+        #[derive(Serialize)]
+        struct BackupEntry {
+            name: String,
+            value: String,
+            r#type: &'static str,
+        }
+        let dump: Vec<BackupEntry> = params
+            .iter()
+            .map(|p| BackupEntry {
+                name: p.name().unwrap_or_default().to_string(),
+                value: p.value().unwrap_or_default().to_string(),
+                r#type: match p.r#type() {
+                    Some(&ParameterType::SecureString) => "SecureString",
+                    _ => "String",
+                },
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&dump).context("serialize backup")?;
+        std::fs::write(&path, &json).with_context(|| format!("write {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        println!(
+            "  backup: {} parameters dumped to {} (mode 0600)",
+            dump.len(),
+            path.display()
+        );
+        Some(path)
+    } else {
+        None
+    };
 
     let new_app = new_prefix
         .strip_prefix(&format!("{}/", prefix_root()))
@@ -1026,23 +1208,43 @@ async fn cmd_migrate(
             Ok::<_, anyhow::Error>((old_name, new_name))
         }
     });
-    let migrated = run_bounded(futs, WRITE_CONCURRENCY).await?;
+    let migrated = run_bounded(futs, write_concurrency()).await?;
     for (old, new) in &migrated {
         println!("  ✓ {} → {}", old, new);
     }
 
-    if delete_old {
-        let old_names: Vec<String> = migrated.iter().map(|(o, _)| o.clone()).collect();
-        println!("deleting {} old parameters...", old_names.len());
-        let deleted = delete_parameters_batched(client, &old_names).await?;
-        for n in deleted {
-            println!("  ✓ deleted {}", n);
+    match (delete_old, confirm) {
+        (true, true) => {
+            let old_names: Vec<String> = migrated.iter().map(|(o, _)| o.clone()).collect();
+            println!("deleting {} old parameters...", old_names.len());
+            let deleted = delete_parameters_batched(client, &old_names).await?;
+            for n in deleted {
+                println!("  ✓ deleted {}", n);
+            }
+            if let Some(p) = backup_path {
+                println!(
+                    "  {} backup preserved at {} (delete this manually once verified)",
+                    "note:".cyan().bold(),
+                    p.display()
+                );
+            }
         }
-    } else {
-        println!(
-            "{} old parameters preserved. Re-run with --delete-old to remove.",
-            migrated.len()
-        );
+        (true, false) => {
+            eprintln!(
+                "{} {} parameters NOT deleted (dry-run). Re-run with `--delete-old --confirm` to delete.",
+                "dry-run:".yellow().bold(),
+                migrated.len()
+            );
+            if let Some(p) = backup_path {
+                eprintln!("         backup: {}", p.display());
+            }
+        }
+        (false, _) => {
+            println!(
+                "{} old parameters preserved. Re-run with `--delete-old --confirm` to remove.",
+                migrated.len()
+            );
+        }
     }
     Ok(())
 }
