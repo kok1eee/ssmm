@@ -51,11 +51,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::List {
-            app,
+            apps,
             all,
             keys_only,
             tags,
-        } => commands::list::cmd_list(&client, app, all, keys_only, tags).await,
+        } => commands::list::cmd_list(&client, apps, all, keys_only, tags).await,
         Command::Put(args) => commands::put::cmd_put(&client, args).await,
         Command::Delete {
             target,
@@ -66,19 +66,19 @@ async fn main() -> Result<()> {
         Command::Show { key, app } => commands::show::cmd_show(&client, key, app).await,
         Command::Dirs => commands::dirs::cmd_dirs(&client).await,
         Command::Sync {
-            app,
+            apps,
             out,
             no_shared,
             include_tags,
             strict,
-        } => commands::sync::cmd_sync(&client, app, out, no_shared, include_tags, strict).await,
+        } => commands::sync::cmd_sync(&client, apps, out, no_shared, include_tags, strict).await,
         Command::Exec {
-            app,
+            apps,
             no_shared,
             include_tags,
             strict,
             cmd,
-        } => commands::exec::cmd_exec(&client, app, no_shared, include_tags, strict, cmd).await,
+        } => commands::exec::cmd_exec(&client, apps, no_shared, include_tags, strict, cmd).await,
         Command::MigrateToExec(args) => commands::migrate_to_exec::cmd_migrate_to_exec(args),
         Command::Migrate {
             old_prefix,

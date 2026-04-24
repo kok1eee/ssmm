@@ -110,6 +110,14 @@ ssmm exec -- ./run.sh --flag value       # use `--` so child flags aren't eaten
 ssmm exec --app myapp --include-tag shared=true -- python -m myapp
 # stderr: ssmm: exec ./run.sh with 10 variables (app=10, shared=0, tag=0)
 
+# Variant overlay — `--app` is repeatable. Later --app wins on key
+# collisions, so a "common" base + a variant overlay works without
+# duplication. Same --app syntax on `sync` and `list`.
+ssmm exec --app knowledge-bot-common --app knowledge-bot-soumu -- /app/bin
+# stderr: ssmm: exec /app/bin with 20 variables (apps=knowledge-bot-common:17,knowledge-bot-soumu:3, shared=0, tag=0)
+# Precedence (low → high): shared < include-tag < apps[0] < apps[1] < ... < apps[N]
+# --strict makes any cross-layer collision (incl. app-vs-app) exit non-zero.
+
 # Show one
 ssmm show kintone-api-token
 

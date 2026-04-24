@@ -60,26 +60,50 @@ pub fn parse_tags(raw: &[String]) -> Result<Vec<(String, String)>> {
 /// sync と exec で共有する、app + shared + tag overlay を畳み込んだ環境マップ。
 pub struct MergedEnv {
     pub map: BTreeMap<String, String>,
-    pub app_params_count: usize,
+    /// 各 app の (name, fetched_count) を指定順で保持。単一 app 時は len=1。
+    pub app_params_counts: Vec<(String, usize)>,
     pub shared_params_count: usize,
     pub tag_params_count: usize,
 }
 
-/// 優先度 app > include-tag > shared で SSM を畳み込み、env key → value に正規化する。
-/// `strict=true` のとき shared/app 衝突があれば bail、false のときは stderr 警告のみ。
+impl MergedEnv {
+    /// ログ用フォーマット: 単一なら `app=5`、複数なら `apps=common:17,soumu:3`
+    pub fn apps_label(&self) -> String {
+        match self.app_params_counts.as_slice() {
+            [] => "app=0".to_string(),
+            [(_, n)] => format!("app={}", n),
+            many => {
+                let parts: Vec<String> = many.iter().map(|(n, c)| format!("{}:{}", n, c)).collect();
+                format!("apps={}", parts.join(","))
+            }
+        }
+    }
+}
+
+/// 優先度 apps[N..0] > include-tag > shared で SSM を畳み込み、env key → value に正規化。
+/// 同じ key が複数 app にある場合は、引数順の後ろ側 (apps[N]) が勝つ (last wins)。
+/// `strict=true` のとき layer 間衝突があれば bail、false のときは stderr 警告のみ。
 pub async fn build_env_map(
     client: &Client,
-    app: &str,
+    apps: &[String],
     no_shared: bool,
     include_tags: &[(String, String)],
     strict: bool,
 ) -> Result<MergedEnv> {
-    let prefix = app_prefix(app);
-    let want_shared = !no_shared && app != "shared";
+    if apps.is_empty() {
+        bail!("build_env_map called with empty apps (internal error)");
+    }
 
-    // 3 本の SSM 問い合わせを並列化 (hot path)
-    let (app_params, shared_params, tag_names) = tokio::try_join!(
-        get_parameters_by_path(client, &prefix),
+    // shared overlay は「app=shared を明示指定した」ケースでのみ抑制
+    let want_shared = !no_shared && !apps.iter().any(|a| a == "shared");
+
+    let app_prefixes: Vec<String> = apps.iter().map(|a| app_prefix(a)).collect();
+
+    // 各 app の fetch + shared + tag_names を並列化 (hot path)
+    let app_fetches =
+        futures::future::try_join_all(app_prefixes.iter().map(|p| get_parameters_by_path(client, p)));
+    let (apps_params, shared_params, tag_names) = tokio::try_join!(
+        app_fetches,
         async {
             if want_shared {
                 get_parameters_by_path(client, shared_prefix()).await
@@ -97,8 +121,9 @@ pub async fn build_env_map(
     )?;
 
     // tag_names から app/shared と重複する name を除いた残りを取得
-    let already: HashSet<&str> = app_params
+    let already: HashSet<&str> = apps_params
         .iter()
+        .flatten()
         .chain(shared_params.iter())
         .filter_map(|p| p.name())
         .collect();
@@ -108,20 +133,23 @@ pub async fn build_env_map(
         .collect();
     let tag_params = get_parameters_by_names(client, &tag_param_names).await?;
 
-    if app_params.is_empty() && shared_params.is_empty() && tag_params.is_empty() {
+    let all_apps_empty = apps_params.iter().all(|p| p.is_empty());
+    if all_apps_empty && shared_params.is_empty() && tag_params.is_empty() {
         bail!(
-            "no parameters found (app={}, shared={}, include-tags={:?})",
-            app,
+            "no parameters found (apps={:?}, shared={}, include-tags={:?})",
+            apps,
             want_shared,
             include_tags
         );
     }
 
-    // 優先度: app > include-tag > shared
-    // 同じ env key を後から上書き → app が最後に入るよう shared → tag → app の順で ingest
+    // ingest 順: shared → tag → apps[0] → apps[1] → ... → apps[N-1]
+    // (後勝ち。同一 key は後で insert したレイヤで上書きされる)
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
     let mut shared_keys: HashSet<String> = HashSet::new();
-    let mut app_keys: HashSet<String> = HashSet::new();
+    let mut tag_keys: HashSet<String> = HashSet::new();
+    // 各 app が投入した key の集合 (conflict 検出用)
+    let mut per_app_keys: Vec<(String, HashSet<String>)> = Vec::with_capacity(apps.len());
 
     for p in &shared_params {
         let key = ssm_name_to_env_key(p.name().unwrap_or_default(), shared_prefix());
@@ -132,38 +160,110 @@ pub async fn build_env_map(
     for p in &tag_params {
         let key = ssm_name_to_env_key_from_root(p.name().unwrap_or_default(), prefix_root());
         let value = p.value().unwrap_or_default().to_string();
+        tag_keys.insert(key.clone());
         merged.insert(key, value);
     }
-    for p in &app_params {
-        let key = ssm_name_to_env_key(p.name().unwrap_or_default(), &prefix);
-        let value = p.value().unwrap_or_default().to_string();
-        app_keys.insert(key.clone());
-        merged.insert(key, value);
+    for (i, params) in apps_params.iter().enumerate() {
+        let prefix = &app_prefixes[i];
+        let mut this_app_keys: HashSet<String> = HashSet::new();
+        for p in params {
+            let key = ssm_name_to_env_key(p.name().unwrap_or_default(), prefix);
+            let value = p.value().unwrap_or_default().to_string();
+            this_app_keys.insert(key.clone());
+            merged.insert(key, value);
+        }
+        per_app_keys.push((apps[i].clone(), this_app_keys));
     }
 
-    let conflicts: Vec<&String> = app_keys.intersection(&shared_keys).collect();
-    if !conflicts.is_empty() {
-        let mut names: Vec<&str> = conflicts.iter().map(|s| s.as_str()).collect();
+    // conflict 検出: shared/tag が後続 app に上書きされたか、app[i] が app[j>i] に上書きされたか
+    let union_app_keys: HashSet<&String> = per_app_keys
+        .iter()
+        .flat_map(|(_, s)| s.iter())
+        .collect();
+
+    let shared_by_app: Vec<&String> = union_app_keys
+        .iter()
+        .filter(|k| shared_keys.contains(k.as_str()))
+        .copied()
+        .collect();
+    let tag_by_app: Vec<&String> = union_app_keys
+        .iter()
+        .filter(|k| tag_keys.contains(k.as_str()) && !shared_keys.contains(k.as_str()))
+        .copied()
+        .collect();
+
+    // app 同士の上書き: apps[j] (j>i) が apps[i] の key を持っていたら conflict
+    // 報告形式: "key (app_a -> app_b)"
+    let mut inter_app_conflicts: Vec<String> = Vec::new();
+    for i in 0..per_app_keys.len() {
+        for j in (i + 1)..per_app_keys.len() {
+            let (ni, si) = &per_app_keys[i];
+            let (nj, sj) = &per_app_keys[j];
+            let mut shared: Vec<&String> = si.intersection(sj).collect();
+            shared.sort();
+            for k in shared {
+                inter_app_conflicts.push(format!("{} ({} <- {})", k, ni, nj));
+            }
+        }
+    }
+
+    let label = if strict {
+        "error:".red().bold()
+    } else {
+        "warning:".yellow().bold()
+    };
+    let mut total_conflicts = 0usize;
+
+    if !shared_by_app.is_empty() {
+        let mut names: Vec<&str> = shared_by_app.iter().map(|s| s.as_str()).collect();
         names.sort();
-        let label = if strict {
-            "error:".red().bold()
-        } else {
-            "warning:".yellow().bold()
-        };
+        names.dedup();
+        total_conflicts += names.len();
         eprintln!(
             "{} {} shared key(s) overridden by app: {}",
             label,
             names.len(),
             names.join(", ")
         );
-        if strict {
-            bail!("aborted by --strict due to {} conflict(s)", names.len());
-        }
     }
+    if !tag_by_app.is_empty() {
+        let mut names: Vec<&str> = tag_by_app.iter().map(|s| s.as_str()).collect();
+        names.sort();
+        names.dedup();
+        total_conflicts += names.len();
+        eprintln!(
+            "{} {} tag key(s) overridden by app: {}",
+            label,
+            names.len(),
+            names.join(", ")
+        );
+    }
+    if !inter_app_conflicts.is_empty() {
+        total_conflicts += inter_app_conflicts.len();
+        eprintln!(
+            "{} {} app key(s) overridden by later --app: {}",
+            label,
+            inter_app_conflicts.len(),
+            inter_app_conflicts.join(", ")
+        );
+    }
+
+    if strict && total_conflicts > 0 {
+        bail!(
+            "aborted by --strict due to {} conflict(s)",
+            total_conflicts
+        );
+    }
+
+    let app_params_counts = apps
+        .iter()
+        .zip(apps_params.iter())
+        .map(|(name, ps)| (name.clone(), ps.len()))
+        .collect();
 
     Ok(MergedEnv {
         map: merged,
-        app_params_count: app_params.len(),
+        app_params_counts,
         shared_params_count: shared_params.len(),
         tag_params_count: tag_params.len(),
     })
@@ -219,6 +319,42 @@ mod tests {
             pairs,
             vec![("URL".to_string(), "https://a.com?x=y".to_string())]
         );
+    }
+
+    #[test]
+    fn apps_label_single() {
+        let me = MergedEnv {
+            map: BTreeMap::new(),
+            app_params_counts: vec![("hikken-schedule".to_string(), 5)],
+            shared_params_count: 0,
+            tag_params_count: 0,
+        };
+        assert_eq!(me.apps_label(), "app=5");
+    }
+
+    #[test]
+    fn apps_label_multiple() {
+        let me = MergedEnv {
+            map: BTreeMap::new(),
+            app_params_counts: vec![
+                ("knowledge-bot-common".to_string(), 17),
+                ("knowledge-bot-soumu".to_string(), 3),
+            ],
+            shared_params_count: 0,
+            tag_params_count: 0,
+        };
+        assert_eq!(me.apps_label(), "apps=knowledge-bot-common:17,knowledge-bot-soumu:3");
+    }
+
+    #[test]
+    fn apps_label_empty() {
+        let me = MergedEnv {
+            map: BTreeMap::new(),
+            app_params_counts: vec![],
+            shared_params_count: 0,
+            tag_params_count: 0,
+        };
+        assert_eq!(me.apps_label(), "app=0");
     }
 
     #[test]

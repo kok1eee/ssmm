@@ -3,20 +3,20 @@ use aws_sdk_ssm::Client;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use crate::app::resolve_app;
+use crate::app::resolve_apps;
 use crate::env_map::{build_env_map, parse_tags};
 
 pub async fn cmd_sync(
     client: &Client,
-    app: Option<String>,
+    apps: Vec<String>,
     out: PathBuf,
     no_shared: bool,
     raw_include_tags: Vec<String>,
     strict: bool,
 ) -> Result<()> {
-    let app = resolve_app(app)?;
+    let apps = resolve_apps(apps)?;
     let include_tags = parse_tags(&raw_include_tags)?;
-    let merged = build_env_map(client, &app, no_shared, &include_tags, strict).await?;
+    let merged = build_env_map(client, &apps, no_shared, &include_tags, strict).await?;
 
     let body: String = merged
         .map
@@ -27,9 +27,9 @@ pub async fn cmd_sync(
     let existing = std::fs::read_to_string(&out).ok();
     if existing.as_deref() == Some(body.as_str()) {
         println!(
-            "ssmm: no change ({} variables; app={}, shared={}, tag={})",
+            "ssmm: no change ({} variables; {}, shared={}, tag={})",
             merged.map.len(),
-            merged.app_params_count,
+            merged.apps_label(),
             merged.shared_params_count,
             merged.tag_params_count
         );
@@ -41,10 +41,10 @@ pub async fn cmd_sync(
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&tmp, &out)?;
     println!(
-        "ssmm: wrote {} variables to {} (app={}, shared={}, tag={})",
+        "ssmm: wrote {} variables to {} ({}, shared={}, tag={})",
         merged.map.len(),
         out.display(),
-        merged.app_params_count,
+        merged.apps_label(),
         merged.shared_params_count,
         merged.tag_params_count
     );

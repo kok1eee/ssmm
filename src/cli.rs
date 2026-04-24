@@ -44,10 +44,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List parameters for an app (CWD auto-detect if no --app)
+    /// List parameters for an app (CWD auto-detect if no --app).
+    ///
+    /// `--app` is repeatable. Multiple `--app a --app b` list each app
+    /// as a separate section (same format as `--all` scoped to the
+    /// specified apps).
     List {
-        #[arg(long)]
-        app: Option<String>,
+        #[arg(long = "app", action = ArgAction::Append, value_name = "APP")]
+        apps: Vec<String>,
         /// Show all parameters under the configured prefix
         #[arg(long)]
         all: bool,
@@ -78,10 +82,17 @@ pub enum Command {
     },
     /// List all app namespaces under the configured prefix with parameter counts
     Dirs,
-    /// Sync SSM -> .env (app + /<prefix>/shared/* + tagged overlays)
+    /// Sync SSM -> .env (app + /<prefix>/shared/* + tagged overlays).
+    ///
+    /// `--app` is repeatable. Multiple `--app a --app b` merge in the
+    /// order given (last wins on key collisions), which lets a variant
+    /// overlay a common base — e.g. `--app knowledge-bot-common --app
+    /// knowledge-bot-soumu`. Precedence: shared < include-tag < apps[0]
+    /// < apps[1] < ... < apps[N]. With `--strict`, any collision between
+    /// layers exits non-zero.
     Sync {
-        #[arg(long)]
-        app: Option<String>,
+        #[arg(long = "app", action = ArgAction::Append, value_name = "APP")]
+        apps: Vec<String>,
         #[arg(long, short, default_value = "./.env")]
         out: PathBuf,
         /// Skip /<prefix>/shared/* overlay (default: included)
@@ -90,8 +101,9 @@ pub enum Command {
         /// Also include parameters matching tag (repeatable)
         #[arg(long = "include-tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
         include_tags: Vec<String>,
-        /// Exit with non-zero status when any shared / tag key is overridden
-        /// by an app-level key (instead of just warning to stderr)
+        /// Exit with non-zero status on any cross-layer key collision
+        /// (shared/tag overridden by an app, or one app overridden by a
+        /// later app). Without this flag collisions warn to stderr.
         #[arg(long)]
         strict: bool,
     },
@@ -110,23 +122,28 @@ pub enum Command {
     /// drop-in resets. Paste the command from `systemctl cat <unit>`
     /// into --exec-cmd.
     MigrateToExec(MigrateToExecArgs),
-    /// Exec a command with SSM parameters injected as env vars (no .env on disk)
+    /// Exec a command with SSM parameters injected as env vars (no .env on disk).
     ///
     /// Resolves parameters the same way as `sync` (app + shared overlay +
     /// include-tag overlay), then replaces the current process with the given
     /// command (execvp). Values never touch the filesystem. Parent environment
     /// variables are inherited; SSM values overlay them.
+    ///
+    /// `--app` is repeatable. `--app common --app soumu` merges both,
+    /// with `soumu` overriding `common` on key collisions (last wins).
+    /// Precedence: shared < include-tag < apps[0] < apps[1] < ... < apps[N].
     Exec {
-        #[arg(long)]
-        app: Option<String>,
+        #[arg(long = "app", action = ArgAction::Append, value_name = "APP")]
+        apps: Vec<String>,
         /// Skip /<prefix>/shared/* overlay (default: included)
         #[arg(long)]
         no_shared: bool,
         /// Also include parameters matching tag (repeatable)
         #[arg(long = "include-tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
         include_tags: Vec<String>,
-        /// Exit with non-zero status when any shared / tag key is overridden
-        /// by an app-level key (instead of just warning to stderr)
+        /// Exit with non-zero status on any cross-layer key collision
+        /// (shared/tag overridden by an app, or one app overridden by a
+        /// later app). Without this flag collisions warn to stderr.
         #[arg(long)]
         strict: bool,
         /// Command and arguments to exec (use `--` before the command so
