@@ -51,6 +51,12 @@ SSM Parameter Store /<team>/<app>/* を source of truth にし、2 方式のい�
   `ListTagsForResource`
 - SecureString は AWS managed key (`alias/aws/ssm`) デフォルト。
   カスタム CMK 使用時は `kms:Decrypt` 追加
+- AWS SSO (IAM Identity Center) 利用時はセッション期限切れで `ssmm`
+  コマンドが `ExpiredToken` で連発しがち。`granted`
+  (`brew install common-fate/granted/granted`) を入れて
+  `assume <profile>` 経由で呼ぶと、期限切れ時に自動でブラウザ SSO
+  フローが走り、credentials が current shell に注入される。
+  `alias assume="source /opt/homebrew/bin/assume"` を `.zshrc` に必須
 
 ## Prefix と命名規則
 
@@ -403,6 +409,7 @@ adaptive retry (max 10 回) は自動。
 
 | 症状 | 対処 |
 |---|---|
+| `ExpiredToken` / `ExpiredTokenException` | SSO セッション切れ。`assume <profile>` で再認証（`granted` 入れていれば自動ブラウザフロー）か `aws sso login --profile <profile>`。頻発するなら `granted` 導入推奨（前提セクション参照） |
 | `Error: no prefix configured` | `export SSMM_PREFIX_ROOT=/<your-team>` or `--prefix /<your-team>` を追加 |
 | `cannot determine CWD basename` | `--app <name>` を明示、あるいは `cd <project-dir>` してから呼ぶ |
 | `warning: empty value, skipped: KEY` | `.env` 側の `KEY=` が空。SSM は空文字列 reject、意図していれば無視 |
