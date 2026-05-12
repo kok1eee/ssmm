@@ -118,9 +118,14 @@ ssmm put --env .env                    # CWD basename を <app> に使う
 ### 2. 検証
 
 ```bash
-ssmm list                              # CWD 自動判定
-ssmm list --keys-only
+ssmm list                              # CWD 自動判定。SecureString は *** にマスクされる
+ssmm list --reveal                     # SecureString も平文表示 (注意: ログに残る場面では避ける)
+ssmm list --keys-only                  # 値を一切出さない
 ```
+
+> v0.8.0 以降、`ssmm list` のデフォルトは SecureString の値を `***` にマスクします。
+> Claude Code 等の AI セッションで誤って secret をログに残さないための safe-by-default。
+> 値を見たい場合は明示的に `--reveal` を付けるか、単一 key なら `ssmm show <KEY>` を使ってください。
 
 ### 3. systemd に接続
 

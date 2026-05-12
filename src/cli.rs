@@ -55,9 +55,16 @@ pub enum Command {
         /// Show all parameters under the configured prefix
         #[arg(long)]
         all: bool,
-        /// Hide values (show keys only)
+        /// Hide values entirely (show keys only). Most secure option.
         #[arg(long)]
         keys_only: bool,
+        /// Reveal plaintext values for SecureString parameters too. Without
+        /// this, SecureString values are masked as `***`. Plain String values
+        /// are always shown. Use only when you actually need to inspect the
+        /// secret (e.g. one-off debugging) — prefer `ssmm show <KEY>` for
+        /// single-value lookups.
+        #[arg(long)]
+        reveal: bool,
         /// Filter by tag (repeatable: --tag env=prod --tag owner=backend)
         #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
         tags: Vec<String>,

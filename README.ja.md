@@ -91,8 +91,12 @@ ssmm put --env .env --plain-key METRICS_URL --plain-key PUBLIC_HOST
 ssmm put --env .env --plain-all                  # 全て String (公開 config 用アプリ)
 
 # 一覧 (CWD から basename でアプリ名を自動判定)
-ssmm list
-ssmm list --keys-only
+# list は SecureString の値をデフォルトで `***` にマスクする。
+# 平文 String の値 (例: LOG_DIR) は表示される。SecureString も平文で
+# 見たいときは --reveal、値を一切出したくないときは --keys-only。
+ssmm list                                        # 🔒 KEY=***, plain KEY=value
+ssmm list --reveal                               # 🔒 KEY=actual-secret (注意して使う)
+ssmm list --keys-only                            # 🔒 KEY (値は一切出ない)
 ssmm list --all                                  # /myteam 配下の全アプリを横断
 ssmm list --tag env=prod
 

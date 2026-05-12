@@ -91,8 +91,12 @@ ssmm put --env .env --plain-key METRICS_URL --plain-key PUBLIC_HOST
 ssmm put --env .env --plain-all                  # everything String (public-config apps)
 
 # List (CWD auto-detects app name via basename)
-ssmm list
-ssmm list --keys-only
+# SecureString values are masked as `***` by default; plain String values
+# (e.g. LOG_DIR) are shown. Use --reveal to decrypt SecureString too,
+# or --keys-only to hide values entirely.
+ssmm list                                        # 🔒 KEY=***, plain KEY=value
+ssmm list --reveal                               # 🔒 KEY=actual-secret (use sparingly)
+ssmm list --keys-only                            # 🔒 KEY (no values at all)
 ssmm list --all                                  # across every app under /myteam
 ssmm list --tag env=prod
 

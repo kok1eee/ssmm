@@ -11,16 +11,24 @@ use crate::ssm::{
     get_parameters_by_names, get_parameters_by_path, names_filtered_by_tags, ssm_name_to_env_key,
     ssm_name_to_env_key_from_root,
 };
-use crate::util::print_entry;
+use crate::util::{DisplayMode, print_entry};
 
 pub async fn cmd_list(
     client: &Client,
     apps: Vec<String>,
     all: bool,
     keys_only: bool,
+    reveal: bool,
     raw_tags: Vec<String>,
 ) -> Result<()> {
     let tag_filters = parse_tags(&raw_tags)?;
+    let mode = if keys_only {
+        DisplayMode::KeysOnly
+    } else if reveal {
+        DisplayMode::Reveal
+    } else {
+        DisplayMode::Default
+    };
 
     // --all は apps/--app を無視して prefix 全体を単一スコープで表示
     if all {
@@ -30,7 +38,7 @@ pub async fn cmd_list(
             println!("(no parameters under {})", prefix.dimmed());
             return Ok(());
         }
-        print_by_app(&params, keys_only);
+        print_by_app(&params, mode);
         return Ok(());
     }
 
@@ -59,7 +67,7 @@ pub async fn cmd_list(
             format!("# {} ({} variables)", prefix, entries.len()).dimmed()
         );
         for (k, v, secure) in entries {
-            print_entry(&k, Some(&v), secure, keys_only, "");
+            print_entry(&k, Some(&v), secure, mode, "");
         }
         return Ok(());
     }
@@ -84,7 +92,7 @@ pub async fn cmd_list(
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         for (k, v, secure) in entries {
-            print_entry(&k, Some(&v), secure, keys_only, "  ");
+            print_entry(&k, Some(&v), secure, mode, "  ");
         }
     }
     Ok(())
@@ -106,7 +114,7 @@ async fn fetch_params(
     }
 }
 
-fn print_by_app(params: &[Parameter], keys_only: bool) {
+fn print_by_app(params: &[Parameter], mode: DisplayMode) {
     let prefix_slash = format!("{}/", prefix_root());
     let mut by_app: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
     for p in params {
@@ -125,7 +133,7 @@ fn print_by_app(params: &[Parameter], keys_only: bool) {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         println!("{}", format!("[{}]", app_name).bold().cyan());
         for (k, v, secure) in entries {
-            print_entry(&k, Some(&v), secure, keys_only, "  ");
+            print_entry(&k, Some(&v), secure, mode, "  ");
         }
     }
 }
