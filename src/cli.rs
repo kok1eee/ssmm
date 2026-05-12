@@ -56,7 +56,8 @@ pub enum Command {
         #[arg(long)]
         all: bool,
         /// Hide values entirely (show keys only). Most secure option.
-        #[arg(long)]
+        /// Mutually exclusive with `--reveal`.
+        #[arg(long, conflicts_with = "reveal")]
         keys_only: bool,
         /// Reveal plaintext values for SecureString parameters too. Without
         /// this, SecureString values are masked as `***`. Plain String values
