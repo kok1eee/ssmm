@@ -57,6 +57,16 @@ SSM Parameter Store /<team>/<app>/* を source of truth にし、2 方式のい�
   `assume <profile>` 経由で呼ぶと、期限切れ時に自動でブラウザ SSO
   フローが走り、credentials が current shell に注入される。
   `alias assume="source /opt/homebrew/bin/assume"` を `.zshrc` に必須
+- **git 履歴への secret 混入は `ssmm` の責任範囲外**: ssmm が守るのは
+  「disk と process env」。`ssmm sync --out .env` が生成した .env を
+  `git add` してしまう事故、開発時に `.env.staging` を repo に放置
+  する事故などは別途 [gitleaks](https://github.com/gitleaks/gitleaks)
+  + [lefthook](https://github.com/evilmartians/lefthook) を pre-commit
+  に仕込んで防ぐ。GitHub の Push Protection も有効化しておくとサーバ側
+  フェイルセーフになる。最小構成:
+  `brew install gitleaks lefthook` → 各 repo で
+  `lefthook` で `gitleaks protect --staged` を pre-commit 化。
+  参考: [4 層防御モデル (Zenn)](https://zenn.dev/takna/articles/secret-leak-prevention-4-layer)
 
 ## Prefix と命名規則
 

@@ -100,7 +100,11 @@ ssmm list --keys-only                            # 🔒 KEY (no values at all)
 ssmm list --all                                  # across every app under /myteam
 ssmm list --tag env=prod
 
-# Sync SSM → .env (systemd ExecStartPre friendly, mode 0600, idempotent)
+# Sync SSM → .env (systemd ExecStartPre friendly, mode 0600, idempotent).
+# IMPORTANT: confirm the .env path is already in .gitignore BEFORE running
+# this in a repo. ssmm produces a plaintext, decrypted file — leaking it
+# to git is the #1 foot-gun. See `Security model` → `git-history protection`
+# below; pair with gitleaks + lefthook so a slip never reaches the remote.
 ssmm sync --out ./.env
 # ssmm: wrote 10 variables to ./.env (app=10, shared=0, tag=0)
 
@@ -407,7 +411,10 @@ under `exec`**. That is the primary difference between the two modes.
 
 ### What either mode protects against
 
-- Accidental commit of plaintext `.env` to git (SSM is the source of truth)
+- Accidental commit of plaintext `.env` to git **by replacing the source
+  of truth** (you no longer have to keep a long-lived `.env` in the repo).
+  This is *displacement*, not *prevention* — see "What ssmm does NOT
+  cover: git-history protection" below.
 - Unauthorized teammates who have SSM read permission but not host login
 - Drift between hosts (central management vs hand-copied `.env` files)
 
@@ -443,6 +450,40 @@ Consider tools that avoid even same-UID environ exposure:
 - **SOPS + age/KMS** — encrypted-at-rest files, decrypt in-app only
 - **Runtime secret brokers** (AWS Secrets Manager SDK called from within
   the app, rotated values, scoped to short-lived in-memory handling)
+
+### What `ssmm` does NOT cover: git-history protection
+
+`ssmm` defends **disk** and **process environment**. It does not stop a
+plaintext secret from sneaking into `git log`. Even with SSM as the
+source of truth, you might:
+
+- run `ssmm sync --out .env` for local development and forget to
+  `gitignore` the path,
+- paste a quick `.env.staging` into the repo "just for testing",
+- have a teammate commit `.env` from a fresh clone before SSM is wired up.
+
+These are out of scope for `ssmm`. Pair it with a **deterministic
+pre-commit / push scanner** so the bad commit never reaches the remote:
+
+| layer | tool | what it catches |
+|---|---|---|
+| `git commit` time | [gitleaks](https://github.com/gitleaks/gitleaks) + [lefthook](https://github.com/evilmartians/lefthook) | local commits containing `KEY=value`-style secrets |
+| `git push` time | GitHub [Push Protection](https://docs.github.com/en/code-security/secret-scanning/protecting-pushes-with-secret-scanning) | server-side fail-safe |
+| AI-driven file writes | a `PreToolUse` Claude Code hook scanning the patch | AI assistants pasting secrets back into files |
+
+Recommended minimum:
+
+```bash
+brew install gitleaks lefthook
+# then configure lefthook to run `gitleaks protect --staged` as a
+# pre-commit hook in each repo that uses ssmm.
+```
+
+See [this writeup (Zenn)](https://zenn.dev/takna/articles/secret-leak-prevention-4-layer)
+for one concrete 4-layer setup. `ssmm` complements that stack — it
+takes care of "where secrets live at rest", while gitleaks /
+Push Protection / Claude Code hooks take care of "secrets must not
+travel into git history".
 
 ## Similar tools
 
