@@ -322,6 +322,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_kv_pairs_rejects_bare_key() {
+        let err = parse_kv_pairs(&["JUST_KEY".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("invalid KEY=VALUE"));
+    }
+
+    #[test]
     fn apps_label_single() {
         let me = MergedEnv {
             map: BTreeMap::new(),

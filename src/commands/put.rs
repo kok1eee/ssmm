@@ -167,3 +167,4 @@ pub async fn cmd_put(client: &Client, args: PutArgs) -> Result<()> {
     )
     .await
 }
+

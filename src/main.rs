@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
             tags,
         } => commands::list::cmd_list(&client, apps, all, keys_only, reveal, tags).await,
         Command::Put(args) => commands::put::cmd_put(&client, args).await,
+        Command::Set(args) => commands::set::cmd_set(&client, args).await,
         Command::Delete {
             target,
             app,

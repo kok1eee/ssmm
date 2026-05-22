@@ -209,6 +209,37 @@ pub enum Command {
     /// For apps ALREADY in SSM that you just want to switch to exec-mode,
     /// use `migrate-to-exec` instead — it skips the put step.
     Onboard(OnboardArgs),
+    /// Interactively set parameter value(s) from a TTY prompt (no echo).
+    ///
+    /// Use for secrets you don't want in shell history, `ps`, or scrollback.
+    /// One prompt per KEY, in order. Empty input aborts. Requires a TTY —
+    /// for scripts, use `put KEY=VALUE` or `put --env <file>` instead.
+    ///
+    /// Example: `ssmm set --app talent-management SLACK_BOT_TOKEN`
+    Set(SetArgs),
+}
+
+#[derive(Args)]
+pub struct SetArgs {
+    /// One or more KEY names. ssmm prompts (no echo) for each value in
+    /// order. Do NOT include `=VALUE` here — use `put` for that.
+    #[arg(value_name = "KEY", required = true)]
+    pub keys: Vec<String>,
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Force ALL values to String (ignores per-key overrides and heuristic)
+    #[arg(long)]
+    pub plain_all: bool,
+    /// Force specific keys to String (repeatable: --plain-key LOG_DIR)
+    #[arg(long = "plain-key", action = ArgAction::Append, value_name = "KEY")]
+    pub plain_keys: Vec<String>,
+    /// Force specific keys to SecureString (repeatable: --secure DATABASE_URL)
+    #[arg(long = "secure", action = ArgAction::Append, value_name = "KEY")]
+    pub secure_keys: Vec<String>,
+    /// Extra tags (repeatable: --tag env=prod --tag owner=backend)
+    /// `app` tag is always attached automatically.
+    #[arg(long = "tag", action = ArgAction::Append, value_name = "KEY=VALUE")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Args)]

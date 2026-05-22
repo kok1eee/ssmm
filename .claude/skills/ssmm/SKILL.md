@@ -125,6 +125,18 @@ cd <app-root>
 ssmm put --env .env                    # CWD basename を <app> に使う
 ```
 
+単発の secret を後から追加するときは `set` を使うと値が shell history /
+`ps` / scrollback に残らない (TTY 必須、no-echo prompt):
+
+```bash
+ssmm set --app talent-management SLACK_BOT_TOKEN
+# Value for SLACK_BOT_TOKEN: ****  (入力は表示されない)
+```
+
+`put` は KEY=VALUE / `--env` 専用 (script 向き)、`set` は対話入力専用
+(secret 投入向き)。`set FOO=bar` のように `=` を渡すと拒否されます
+(history に値が残るのを防ぐため)。
+
 ### 2. 検証
 
 ```bash

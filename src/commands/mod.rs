@@ -7,6 +7,7 @@ pub mod migrate;
 pub mod migrate_to_exec;
 pub mod onboard;
 pub mod put;
+pub mod set;
 pub mod show;
 pub mod sync;
 pub mod tag;

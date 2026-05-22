@@ -90,6 +90,12 @@ ssmm put --env .env --secure DATABASE_URL --secure SENTRY_DSN
 ssmm put --env .env --plain-key METRICS_URL --plain-key PUBLIC_HOST
 ssmm put --env .env --plain-all                  # everything String (public-config apps)
 
+# Interactive secret entry — no-echo TTY prompt, value stays out of shell
+# history / `ps` / scrollback. Same flags as `put` (--secure, --tag, ...).
+ssmm set --app your-app SLACK_BOT_TOKEN
+# Value for SLACK_BOT_TOKEN: ****                # input is hidden
+ssmm set --app your-app SLACK_BOT_TOKEN STRIPE_SECRET_KEY   # multiple, one prompt each
+
 # List (CWD auto-detects app name via basename)
 # SecureString values are masked as `***` by default; plain String values
 # (e.g. LOG_DIR) are shown. Use --reveal to decrypt SecureString too,
