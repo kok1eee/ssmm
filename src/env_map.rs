@@ -57,6 +57,45 @@ pub fn parse_tags(raw: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// app 内 (同一 prefix) で複数の SSM param 名が同じ env key に正規化された衝突。
+/// `ssm_name_to_env_key` が `/` と `-` を両方 `_` に潰すため、
+/// `x/kyushu/access-token` と `x-kyushu-access-token` のような別 param が
+/// 同じ `X_KYUSHU_ACCESS_TOKEN` に collapse する。どれが採用されたかは
+/// SSM の返却順 (= insert 順) 依存で非直感的なため warning で可視化する。
+struct IntraAppCollision {
+    app: String,
+    env_key: String,
+    /// 衝突した SSM param 名を insert 順で。最後が `winner`。
+    param_names: Vec<String>,
+    /// merged の値を勝ち取った param 名 (= insert 順で最後)。
+    winner: String,
+}
+
+/// `env key → 同一 app 内でその key に正規化された SSM param 名 (insert 順)` の map から、
+/// 2 つ以上の異なる param 名が collapse した env key を衝突として抽出する。
+/// merged は last-wins で insert されるため、各 names の末尾が勝者 (winner)。
+/// 純粋関数なので AWS クライアント無しで単体テストできる。
+fn collisions_from_key_names(
+    app: &str,
+    key_to_names: BTreeMap<String, Vec<String>>,
+) -> Vec<IntraAppCollision> {
+    key_to_names
+        .into_iter()
+        .filter_map(|(key, names)| {
+            if names.len() <= 1 {
+                return None;
+            }
+            let winner = names.last().cloned().expect("len > 1 guarantees non-empty");
+            Some(IntraAppCollision {
+                app: app.to_string(),
+                env_key: key,
+                param_names: names,
+                winner,
+            })
+        })
+        .collect()
+}
+
 /// sync と exec で共有する、app + shared + tag overlay を畳み込んだ環境マップ。
 pub struct MergedEnv {
     pub map: BTreeMap<String, String>,
@@ -150,6 +189,10 @@ pub async fn build_env_map(
     let mut tag_keys: HashSet<String> = HashSet::new();
     // 各 app が投入した key の集合 (conflict 検出用)
     let mut per_app_keys: Vec<(String, HashSet<String>)> = Vec::with_capacity(apps.len());
+    // app 内 (同一 prefix) で複数の SSM param 名が同じ env key に正規化された衝突を記録。
+    // 同じ env key に対して投入された param 名を insert 順で保持する。
+    // 例: `x/kyushu/access-token` と `x-kyushu-access-token` が両方 `X_KYUSHU_ACCESS_TOKEN`。
+    let mut intra_app_collisions: Vec<IntraAppCollision> = Vec::new();
 
     for p in &shared_params {
         let key = ssm_name_to_env_key(p.name().unwrap_or_default(), shared_prefix());
@@ -166,12 +209,21 @@ pub async fn build_env_map(
     for (i, params) in apps_params.iter().enumerate() {
         let prefix = &app_prefixes[i];
         let mut this_app_keys: HashSet<String> = HashSet::new();
+        // この app 内で env key → 投入された param 名 (insert 順) を追跡。
+        let mut key_to_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in params {
-            let key = ssm_name_to_env_key(p.name().unwrap_or_default(), prefix);
+            let name = p.name().unwrap_or_default();
+            let key = ssm_name_to_env_key(name, prefix);
             let value = p.value().unwrap_or_default().to_string();
             this_app_keys.insert(key.clone());
+            key_to_names
+                .entry(key.clone())
+                .or_default()
+                .push(name.to_string());
             merged.insert(key, value);
         }
+        // 1 つの env key に 2 つ以上の異なる param 名が collapse したものを衝突として記録。
+        intra_app_collisions.extend(collisions_from_key_names(&apps[i], key_to_names));
         per_app_keys.push((apps[i].clone(), this_app_keys));
     }
 
@@ -245,6 +297,42 @@ pub async fn build_env_map(
             label,
             inter_app_conflicts.len(),
             inter_app_conflicts.join(", ")
+        );
+    }
+    // app 内 (同一 prefix) の正規化衝突: 複数の SSM param 名が同じ env key に潰れた。
+    // どれが採用されたか (winner) を明示する。クロス app override と同じスタイル。
+    if !intra_app_collisions.is_empty() {
+        total_conflicts += intra_app_collisions.len();
+        let multi_app = per_app_keys.len() > 1;
+        let detail: Vec<String> = intra_app_collisions
+            .iter()
+            .map(|c| {
+                // 衝突 param 名を winner 印付きで列挙: "name1, name2 (winner)"
+                let names: Vec<String> = c
+                    .param_names
+                    .iter()
+                    .map(|n| {
+                        if *n == c.winner {
+                            format!("{} (winner)", n)
+                        } else {
+                            n.clone()
+                        }
+                    })
+                    .collect();
+                let scope = if multi_app {
+                    format!("{}/{}", c.app, c.env_key)
+                } else {
+                    c.env_key.clone()
+                };
+                format!("{} [{}]", scope, names.join(", "))
+            })
+            .collect();
+        eprintln!(
+            "{} {} env key(s) had multiple SSM params normalize to the same name within an app; \
+             value chosen by SSM return order (non-deterministic): {}",
+            label,
+            intra_app_collisions.len(),
+            detail.join("; ")
         );
     }
 
@@ -361,6 +449,72 @@ mod tests {
             tag_params_count: 0,
         };
         assert_eq!(me.apps_label(), "app=0");
+    }
+
+    #[test]
+    fn collisions_from_key_names_detects_slash_vs_flat() {
+        // x/kyushu/access-token と x-kyushu-access-token が両方 X_KYUSHU_ACCESS_TOKEN に潰れる。
+        // insert 順で最後 (flat) が winner。
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        m.insert(
+            "X_KYUSHU_ACCESS_TOKEN".to_string(),
+            vec![
+                "/amu-revo/postdata/x/kyushu/access-token".to_string(),
+                "/amu-revo/postdata/x-kyushu-access-token".to_string(),
+            ],
+        );
+        let cols = collisions_from_key_names("postdata", m);
+        assert_eq!(cols.len(), 1);
+        let c = &cols[0];
+        assert_eq!(c.app, "postdata");
+        assert_eq!(c.env_key, "X_KYUSHU_ACCESS_TOKEN");
+        assert_eq!(c.param_names.len(), 2);
+        assert_eq!(c.winner, "/amu-revo/postdata/x-kyushu-access-token");
+    }
+
+    #[test]
+    fn collisions_from_key_names_ignores_unique_keys() {
+        // それぞれ別 env key に正規化される単独 param は衝突ではない。
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        m.insert(
+            "KINTONE_ID".to_string(),
+            vec!["/amu-revo/app/kintone-id".to_string()],
+        );
+        m.insert(
+            "SLACK_BOT_TOKEN".to_string(),
+            vec!["/amu-revo/app/slack-bot-token".to_string()],
+        );
+        let cols = collisions_from_key_names("app", m);
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn collisions_from_key_names_multiple_and_threeway() {
+        // 複数 env key の衝突 + 3 つ以上の collapse を同時に検出。
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        m.insert(
+            "API_KEY".to_string(),
+            vec![
+                "/r/app/api/key".to_string(),
+                "/r/app/api-key".to_string(),
+                "/r/app/api/key2".to_string(), // ← これは別 key になる想定だが手動で同 key に束ねてテスト
+            ],
+        );
+        m.insert(
+            "DB_PASS".to_string(),
+            vec![
+                "/r/app/db/pass".to_string(),
+                "/r/app/db-pass".to_string(),
+            ],
+        );
+        let cols = collisions_from_key_names("app", m);
+        // BTreeMap なので env_key 昇順: API_KEY, DB_PASS
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].env_key, "API_KEY");
+        assert_eq!(cols[0].param_names.len(), 3);
+        assert_eq!(cols[0].winner, "/r/app/api/key2");
+        assert_eq!(cols[1].env_key, "DB_PASS");
+        assert_eq!(cols[1].winner, "/r/app/db-pass");
     }
 
     #[test]
